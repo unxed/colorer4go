@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE hrc PUBLIC "-//Cail Lomecb//DTD Colorer HRC take5//EN"
+  "http://colorer.sf.net/2003/hrc.dtd">
+<hrc version="take5" xmlns="http://colorer.sf.net/2003/hrc"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://colorer.sf.net/2003/hrc http://colorer.sf.net/2003/hrc.xsd">
+   <type name="cobolfr">
+      <annotation>
+         <documentation>
+           COBOL Syntax description
+
+           COBOL Free Format reference source line has no fixed margin and
+           first six columns are considered part of normal source. Column one takes
+           role of indicator area: [dD*/], or with any other character is treated
+           as normal source line.
+         </documentation>
+      </annotation>
+
+      <region name="Debug"     parent="def:Debug"/>
+      <region name="Special"   parent="def:Label"/>
+      <region name="Comment"   parent="def:Comment"/>
+      <region name="Indicator" parent="def:Symbol"/>
+      <region name="Symbol"    parent="def:Symbol"/>
+      <region name="Period"    parent="def:SymbolStrong"/>
+      <region name="Keyword"   parent="def:Keyword"/>
+      <region name="Section"   parent="def:VarStrong"/>
+      <region name="Exec"      parent="def:StringEdge"/>
+      <region name="Number"    parent="def:Number"/>
+      <region name="String"    parent="def:String"/>
+      <region name="Ident"     parent="def:Text"/>
+
+      <region name="start" parent="def:PairStart"/>
+      <region name="end"   parent="def:PairEnd"/>
+
+      <entity name="worddiv" value="[\W-[\-]]"/> <!-- minus can be part of identifier -->
+
+      <scheme name="exec">
+         <!-- Comment lines -->
+         <regexp match="/^[*/].*$/" region0="Comment"/>
+         <!-- Comments -->
+         <regexp match="/\*&gt;.*$/" region0="Comment"/>
+         <!-- EXEC statement usually contains embedded SQL -->
+         <inherit scheme="sql:sql"/>
+      </scheme>
+
+      <scheme name="cobolfr">
+         <!-- Debug lines -->
+         <regexp match="/^D\ .*$/i" region0="Debug"/>
+         <!-- Special lines -->
+         <regexp match="/^\$.*$/" region0="Special"/><!-- Microfocus -->
+         <regexp match="/^\ {7}&gt;&gt;SOURCE.*$/" region0="Special"/><!-- OpenCobol -->
+         <regexp match="/^\ *\@OPTIONS.*$/" region0="Special"/><!-- Fujitsu -->
+         <!-- Comment lines -->
+         <regexp match="/^[*/].*$/" region0="Comment"/>
+         <!-- Comments -->
+         <regexp match="/\*&gt;.*$/" region0="Comment"/>
+         <!-- Comment entries -->
+         <regexp match="/^\s*(REMARKS|AUTHOR|DATE-COMPILED|DATE-WRITTEN|INSTALLATION|SECURITY)(\.)?(.*)$/i" region1="Keyword" region2="Period" region3="Comment"/>
+         <!-- Sections and Divisions -->
+         <regexp match="/^\s*([\w\-]+\s+(SECTION|DIVISION))[ .]?=/i" region1="Section"/>
+         <!-- Paired brackets -->
+         <block start="/(?{start}\()/" end="/(?{end}\))/" scheme="cobolfr" region00="Symbol" region10="Symbol" inner-region="yes"/>
+         <!-- Numeric literals with fixed point -->
+         <regexp match="/(^|[\s:(]?#1)([+\-])?(\d*\.?\d+)([\s:).]?=|$)/i" region2="Symbol" region3="Number"/>
+         <!-- ... character string in PIC clause is not a number even if it looks so -->
+         <regexp match="/\s(PIC|PICTURE)(\s+IS)?\s+([09]+)([\s.]?=|$)/i" region1="Keyword" region2="Keyword" region3="Ident"/>
+         <!-- Numeric literals with floating point -->
+         <regexp match="/(^|[\s:(]?#1)([+\-])?(\d+\.\d+E[+\-]?\d\d?)([\s:).]?=|$)/i" region2="Symbol" region3="Number"/>
+         <!-- Alphanumeric literals -->
+         <block start="/(?{start}([&quot;&apos;]))/" end="/((?{end}\Y1)|(?{def:Error}$))/" scheme="def:empty" region="String"/>
+         <!-- EXEC statements -->
+         <block start="/(^|\s?#1)(?{start}EXEC|EXECUTE)(\s?=|$)/i" end="/(^|\s?#1)(?{end}END-EXEC)([\s.]?=|$)/i" scheme="exec" region00="Exec" region10="Exec"/>
+         <!-- Symbols and Keywords are shared with 'cobol' -->
+         <inherit scheme="cobol:keywords"/>
+      </scheme>
+   </type>
+</hrc>
+<!--
+Copyright (C) 1999-2005 Igor Russkih <irusskih@gmail.com>
+Copyright (C) Pavel Pleva
+
+This library is free software; you can redistribute it and/or
+modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation; either
+version 2.1 of the License, or (at your option) any later version.
+
+This library is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public
+License along with this library; if not, see <https://www.gnu.org/licenses/>
+-->
