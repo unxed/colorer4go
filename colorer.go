@@ -5,6 +5,8 @@ import (
 	_ "embed"
 	"errors"
 	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -13,6 +15,28 @@ import (
 
 //go:embed build_wasm/colorer.wasm
 var colorerWasm []byte
+
+var (
+	cacheOnce        sync.Once
+	compilationCache wazero.CompilationCache
+)
+
+// sharedCompilationCache returns a process-wide cache of compiled WASM code.
+// Compiling the embedded module is by far the most expensive part of creating
+// a session, so the machine code is stored on disk and reused both by later
+// sessions and by later runs of the program.
+func sharedCompilationCache() wazero.CompilationCache {
+	cacheOnce.Do(func() {
+		if dir, err := os.UserCacheDir(); err == nil {
+			if cache, cErr := wazero.NewCompilationCacheWithDir(filepath.Join(dir, "colorer4go")); cErr == nil {
+				compilationCache = cache
+				return
+			}
+		}
+		compilationCache = wazero.NewCompilationCache()
+	})
+	return compilationCache
+}
 
 type Region struct {
 	Start int
@@ -29,7 +53,8 @@ type Session struct {
 
 // NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM
 func NewSession(ctx context.Context, catalogPath string, configDirMount string) (*Session, error) {
-	r := wazero.NewRuntime(ctx)
+	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().
+		WithCompilationCache(sharedCompilationCache()))
 
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 

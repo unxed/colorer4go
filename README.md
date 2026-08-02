@@ -14,8 +14,8 @@ The package `github.com/unxed/colorer4go` exports a clean, idiomatic Go API unde
 Represents a matched syntax highlighting token/region.
 ```go
 type Region struct {
-	Start int    // Start byte index of the token in the parsed line (UTF-8)
-	End   int    // End byte index of the token in the parsed line (UTF-8)
+	Start int    // Start offset of the token, in UTF-16 code units
+	End   int    // End offset of the token, in UTF-16 code units
 	Name  string // The classification name (e.g. "def:Comment", "def:SymbolStrong")
 }
 ```
