@@ -1,4 +1,4 @@
-module colorer4go
+module github.com/unxed/colorer4go
 
 go 1.25.5
 
