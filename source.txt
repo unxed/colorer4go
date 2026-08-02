@@ -1,0 +1,6 @@
+
+colorer source:
+
+https://packages.ubuntu.com/source/resolute/far2l
+
+far2l git tag: v_2.8.0
