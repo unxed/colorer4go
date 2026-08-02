@@ -2,9 +2,121 @@
 
 This project is a high-performance pure Go port of the **Colorer** syntax highlighting engine. It compiles the C++ core engine to WebAssembly (WASI) and runs it via the lightweight, CGO-free, JIT-enabled **wazero** virtual machine.
 
-## Build Requirements
+---
 
-If you want to modify the C++ wrapper and rebuild `colorer.wasm`:
+## Go API Reference
+
+The package `github.com/unxed/colorer4go` exports a clean, idiomatic Go API under the package namespace `colorer`. You do not need to deal with WebAssembly memory or C++ pointers; everything is handled internally.
+
+### Types
+
+#### `type Region struct`
+Represents a matched syntax highlighting token/region.
+```go
+type Region struct {
+	Start int    // Start byte index of the token in the parsed line (UTF-8)
+	End   int    // End byte index of the token in the parsed line (UTF-8)
+	Name  string // The classification name (e.g. "def:Comment", "def:SymbolStrong")
+}
+```
+
+#### `type Session struct`
+A stateful syntax highlighting session. Since Colorer maintains state (caches) across parsed lines to handle multi-line blocks correctly, a `Session` is stateful.
+
+> **Concurrency Note:** `Session` is not thread-safe. If you need to parse text in multiple goroutines, instantiate a separate `Session` for each goroutine.
+
+---
+
+### Functions & Methods
+
+#### `func NewSession`
+Instantiates a new Colorer WASM environment and loads the catalog rules.
+```go
+func NewSession(ctx context.Context, catalogPath string, configDirMount string) (*Session, error)
+```
+* `catalogPath`: Path to the `catalog.xml` file inside the WASM virtual filesystem (e.g., `"/base/catalog.xml"`).
+* `configDirMount`: The path on the host machine containing the Colorer configurations (e.g., `"colorer/configs"`). It will be mounted as the root `/` inside the WASM sandbox.
+
+#### `func (*Session) SelectType`
+Selects the syntax highlighting scheme (HRC type) based on the file name and/or the first line of the file.
+```go
+func (s *Session) SelectType(fileName, firstLine string) (bool, error)
+```
+* `fileName`: The name of the file (e.g., `"test.json"`), used for extension matching.
+* `firstLine`: The first line of the file, used for shebang or header matching.
+* Returns `true` if a suitable scheme was found and loaded successfully.
+
+#### `func (*Session) ParseLine`
+Parses a single line of text and returns a list of highlighting regions.
+```go
+func (s *Session) ParseLine(line string) ([]Region, error)
+```
+* `line`: A single line of UTF-8 encoded text.
+* Returns a slice of `Region` tokens.
+
+#### `func (*Session) Reset`
+Resets the session's internal line-state cache and clears stored lines. Call this when you want to start parsing a completely new file within the same session.
+```go
+func (s *Session) Reset()
+```
+
+#### `func (*Session) Close`
+Closes the session, deallocates C++ memory, and shuts down the wazero runtime. Always use `defer session.Close()` after creation.
+```go
+func (s *Session) Close()
+```
+
+---
+
+### Complete Go Usage Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/unxed/colorer4go"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Instantiate the session (mounts host config directory to WASM root "/")
+	session, err := colorer.NewSession(ctx, "/base/catalog.xml", "colorer/configs")
+	if err != nil {
+		log.Fatalf("Failed to create session: %v", err)
+	}
+	defer session.Close()
+
+	// Detect and load the JSON highlighting scheme
+	success, err := session.SelectType("test.json", "{")
+	if err != nil || !success {
+		log.Fatalf("Failed to select JSON scheme")
+	}
+
+	// Parse a line
+	line := `{"key": "value"}`
+	regions, err := session.ParseLine(line)
+	if err != nil {
+		log.Fatalf("Failed to parse: %v", err)
+	}
+
+	// Print matched tokens
+	fmt.Printf("Parsed %d regions:\n", len(regions))
+	for _, r := range regions {
+		fmt.Printf("  [%d..%d]: %s\n", r.Start, r.End, r.Name)
+	}
+}
+```
+
+---
+
+## Build Requirements (For WASM Recompilation)
+
+If you want to modify the C++ wrapper and rebuild `colorer.wasm` yourself:
 1. **WASI SDK** (v23+): https://github.com/WebAssembly/wasi-sdk
 2. **Binaryen** (v115+ for `wasm-opt` optimization): https://github.com/WebAssembly/binaryen
 
