@@ -1,1 +1,2 @@
-build_wasm/
+build_wasm/*
+!build_wasm/colorer.wasm
