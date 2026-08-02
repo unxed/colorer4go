@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.14)
 project(ColorerWasm C CXX)
 
+# Глобально отключаем исключения C++ и сохраняем RTTI для поддержки dynamic_cast в ядре
+add_compile_options(-fno-exceptions -frtti)
+
 # --- 1. Настройка зависимости: LibXml2 ---
 # Скачиваем и собираем libxml2 как статическую библиотеку для WASM
 include(FetchContent)
@@ -41,6 +44,7 @@ colorer_extract_version()
 add_subdirectory(${LIBCOLORER_TREE} colorer_lib_build)
 
 # --- 3. Сборка нашей C-обертки в WASM ---
+# Собираем как исполняемый файл (executable), так как WASM Reactor на WASI компилируется как статический исполняемый файл
 add_executable(colorer_wasm
     wrapper/colorer_wrapper.cpp
 )
@@ -54,9 +58,9 @@ target_link_libraries(colorer_wasm PRIVATE
     colorer::colorer
 )
 
-# Указываем флаги для WASM (экспортируем нужные функции)
+# Указываем флаги для WASM (собираем в режиме Reactor и экспортируем функции)
 set_target_properties(colorer_wasm PROPERTIES
     OUTPUT_NAME "colorer"
     SUFFIX ".wasm"
-    LINK_FLAGS "-Wl,--export-dynamic -Wl,--no-entry -Wl,--allow-undefined"
+    LINK_FLAGS "-mexec-model=reactor -Wl,--export-dynamic -Wl,--export=colorer_alloc -Wl,--export=colorer_free -Wl,--export=colorer_init -Wl,--export=colorer_destroy -Wl,--export=colorer_reset_session -Wl,--export=colorer_select_type -Wl,--export=colorer_parse_line -Wl,--export=colorer_get_region_start -Wl,--export=colorer_get_region_end -Wl,--export=colorer_get_region_name"
 )

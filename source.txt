@@ -1,6 +1,9 @@
 
 colorer source:
-
 https://packages.ubuntu.com/source/resolute/far2l
 
 far2l git tag: v_2.8.0
+
+3rd party software versions used:
+binaryen-version_131-x86_64-linux.tar.gz
+wasi-sdk-34.0-rc.2-x86_64-linux.tar.gz

@@ -50,7 +50,7 @@ void HrcLibrary::Impl::loadSource(XmlInputSource* input_source, const LoadType l
     // восстанавливаем контекст
     current_input_source = temp_is;
     current_load_type = temp_lt;
-    throw;
+    ((void)0);
   }
 
   // восстанавливаем контекст
