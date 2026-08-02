@@ -25,7 +25,7 @@ cmake .. \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
     -DCMAKE_BUILD_TYPE=Release
 
-# Собираем
+# Build/Compile
 make -j$(nproc)
 
 echo "Success! WASM binary is located at: $BUILD_DIR/colorer.wasm"

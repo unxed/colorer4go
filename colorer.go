@@ -24,29 +24,29 @@ type Session struct {
 	ctx  context.Context
 	r    wazero.Runtime
 	mod  api.Module
-	ptr  uint32 // Указатель на структуру ColorerSession в C++
+	ptr  uint32 // Pointer to the ColorerSession struct in C++
 }
 
-// NewSession инициализирует Colorer, монтируя локальную папку configDirMount внутрь WASM
+// NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM
 func NewSession(ctx context.Context, catalogPath string, configDirMount string) (*Session, error) {
 	r := wazero.NewRuntime(ctx)
 
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
-	// Компилируем модуль для инспекции импортов
+	// Compile the module to inspect imports
 	compiled, err := r.CompileModule(ctx, colorerWasm)
 	if err != nil {
 		r.Close(ctx)
 		return nil, err
 	}
 
-	// Всегда создаем модуль "env" на случай обращений к нему
+	// Always instantiate the "env" module in case there are references to it
 	envBuilder := r.NewHostModuleBuilder("env")
 	for _, f := range compiled.ImportedFunctions() {
 		if f.ModuleName() == "env" {
 			envBuilder.NewFunctionBuilder().
 				WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-					// Пустая заглушка
+					// Empty stub
 				}), f.ParamTypes(), f.ResultTypes()).
 				Export(f.Name())
 		}
@@ -56,8 +56,8 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 		return nil, err
 	}
 
-	// Монтируем папку с XML-схемами в корень WASM-окружения
-	// Перенаправляем Stderr/Stdout в консоль хоста для перехвата сообщений об ошибках C++
+	// Mount the host config directory containing XML schemas to the WASM root "/"
+	// Redirect Stderr/Stdout to host console to intercept C++ error prints
 	config := wazero.NewModuleConfig().
 		WithFSConfig(wazero.NewFSConfig().WithDirMount(configDirMount, "/")).
 		WithStdout(os.Stdout).
@@ -69,7 +69,7 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 		return nil, err
 	}
 
-	// Инициализируем рантайм WASI Reactor для развертывания глобальных конструкторов C++
+	// Initialize the WASI Reactor runtime to deploy C++ global constructors
 	initWasiFn := mod.ExportedFunction("_initialize")
 	if initWasiFn != nil {
 		if _, err := initWasiFn.Call(ctx); err != nil {
@@ -85,7 +85,7 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 		return nil, errors.New("required functions (colorer_alloc or colorer_init) are not exported from WASM")
 	}
 
-	// Копируем путь к каталогу в память WASM
+	// Copy the catalog path string to WASM memory
 	pathBytes := []byte(catalogPath)
 	pathLen := uint64(len(pathBytes) + 1)
 	res, err := allocFn.Call(ctx, pathLen)
@@ -186,7 +186,7 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 		rEnd, _ := getEnd.Call(s.ctx, uint64(s.ptr), uint64(i))
 		rNamePtr, _ := getName.Call(s.ctx, uint64(s.ptr), uint64(i))
 
-		// Читаем имя региона из памяти WASM до нулевого байта
+		// Read the region classification name from WASM memory up to the null-terminator
 		nameStr, err := readString(s.mod.Memory(), uint32(rNamePtr[0]))
 		if err != nil {
 			return nil, err

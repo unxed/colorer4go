@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-// Экспортируемые функции (C API)
+// Exported C API functions
 __attribute__((used)) void* colorer_alloc(size_t size);
 __attribute__((used)) void colorer_free(void* ptr);
 __attribute__((used)) void* colorer_init(const char* catalog_path);
