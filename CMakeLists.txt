@@ -62,5 +62,5 @@ target_link_libraries(colorer_wasm PRIVATE
 set_target_properties(colorer_wasm PROPERTIES
     OUTPUT_NAME "colorer"
     SUFFIX ".wasm"
-    LINK_FLAGS "-mexec-model=reactor -Wl,--export-dynamic -Wl,--export=colorer_alloc -Wl,--export=colorer_free -Wl,--export=colorer_init -Wl,--export=colorer_destroy -Wl,--export=colorer_reset_session -Wl,--export=colorer_select_type -Wl,--export=colorer_parse_line -Wl,--export=colorer_get_region_start -Wl,--export=colorer_get_region_end -Wl,--export=colorer_get_region_name"
+    LINK_FLAGS "-mexec-model=reactor -Wl,--export-dynamic -Wl,--export=colorer_alloc -Wl,--export=colorer_free -Wl,--export=colorer_init -Wl,--export=colorer_destroy -Wl,--export=colorer_reset_session -Wl,--export=colorer_set_hrd -Wl,--export=colorer_enum_hrd_instances -Wl,--export=colorer_get_hrd_name -Wl,--export=colorer_get_hrd_description -Wl,--export=colorer_get_region_define -Wl,--export=colorer_select_type -Wl,--export=colorer_parse_line -Wl,--export=colorer_get_region_start -Wl,--export=colorer_get_region_end -Wl,--export=colorer_get_region_name -Wl,--export=colorer_get_region_fore -Wl,--export=colorer_get_region_back -Wl,--export=colorer_get_region_style -Wl,--export=colorer_get_region_is_fore_set -Wl,--export=colorer_get_region_is_back_set"
 )

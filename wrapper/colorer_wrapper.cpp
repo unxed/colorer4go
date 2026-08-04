@@ -11,6 +11,11 @@ struct WasmRegion {
     int start;
     int end;
     const char* name;
+    unsigned int fore;
+    unsigned int back;
+    unsigned int style;
+    int isForeSet;
+    int isBackSet;
 };
 
 class WasmLineSource : public LineSource {
@@ -42,22 +47,29 @@ public:
             if (lr->special || lr->region == nullptr) {
                 continue;
             }
-            const Region* region = lr->region;
-            if (name_cache.find(region) == name_cache.end()) {
-                std::string chain = UStr::to_stdstr(&region->getName());
-                const Region* p = region->getParent();
-                while (p) {
-                    chain += "|";
-                    chain += UStr::to_stdstr(&p->getName());
-                    p = p->getParent();
+            if (name_cache.find(lr->region) == name_cache.end()) {
+                name_cache[lr->region] = UStr::to_stdstr(&lr->region->getName());
+            }
+
+            unsigned int fore = 0, back = 0, style = 0;
+            int isForeSet = 0, isBackSet = 0;
+            if (lr->rdef) {
+                const StyledRegion* sr = StyledRegion::cast(lr->rdef);
+                if (sr) {
+                    fore = sr->fore;
+                    back = sr->back;
+                    style = sr->style;
+                    isForeSet = sr->isForeSet ? 1 : 0;
+                    isBackSet = sr->isBackSet ? 1 : 0;
                 }
-                name_cache[region] = chain;
             }
-            int end_idx = lr->end;
-            if (end_idx == -1) {
-                end_idx = line_source->lines[lno].length();
-            }
-            regions.push_back({lr->start, end_idx, name_cache[region].c_str()});
+
+            regions.push_back({
+                lr->start,
+                lr->end,
+                name_cache[lr->region].c_str(),
+                fore, back, style, isForeSet, isBackSet
+            });
         }
     }
 };
@@ -68,6 +80,11 @@ struct ColorerSession {
     WasmLineSource line_source;
     std::unordered_map<const Region*, std::string> name_cache;
     WasmRegionHandler region_handler;
+    std::unique_ptr<RegionMapper> mapper;
+
+    std::vector<const HrdNode*> hrd_cache;
+    std::string last_hrd_name;
+    std::string last_hrd_desc;
 
     ColorerSession() : region_handler(name_cache) {}
 };
@@ -110,6 +127,65 @@ void colorer_reset_session(void* handle) {
     }
 }
 
+int colorer_set_hrd(void* handle, const char* hrd_class, const char* hrd_name) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return 0;
+    UnicodeString cls(hrd_class);
+    UnicodeString name(hrd_name);
+    try {
+        session->mapper = session->factory->createStyledMapper(&cls, &name);
+        session->region_handler.setRegionMapper(session->mapper.get());
+        UnicodeString def_text("def:Text");
+        session->region_handler.setBackground(session->mapper->getRegionDefine(def_text));
+        UnicodeString def_spec("def:Special");
+        session->region_handler.setSpecialRegion(session->factory->getHrcLibrary().getRegion(&def_spec));
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int colorer_enum_hrd_instances(void* handle, const char* class_id) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return 0;
+    UnicodeString cls(class_id);
+    session->hrd_cache = session->factory->enumHrdInstances(cls);
+    return session->hrd_cache.size();
+}
+
+const char* colorer_get_hrd_name(void* handle, int index) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || index < 0 || index >= session->hrd_cache.size()) return nullptr;
+    session->last_hrd_name = UStr::to_stdstr(&session->hrd_cache[index]->hrd_name);
+    return session->last_hrd_name.c_str();
+}
+
+const char* colorer_get_hrd_description(void* handle, int index) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || index < 0 || index >= session->hrd_cache.size()) return nullptr;
+    session->last_hrd_desc = UStr::to_stdstr(&session->hrd_cache[index]->hrd_description);
+    return session->last_hrd_desc.c_str();
+}
+
+int colorer_get_region_define(void* handle, const char* name, unsigned int* fore, unsigned int* back, unsigned int* style, int* isForeSet, int* isBackSet) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !session->mapper) return 0;
+    UnicodeString reg_name(name);
+    const RegionDefine* rd = session->mapper->getRegionDefine(reg_name);
+    if (rd) {
+        const StyledRegion* sr = StyledRegion::cast(rd);
+        if (sr) {
+            if (fore) *fore = sr->fore;
+            if (back) *back = sr->back;
+            if (style) *style = sr->style;
+            if (isForeSet) *isForeSet = sr->isForeSet ? 1 : 0;
+            if (isBackSet) *isBackSet = sr->isBackSet ? 1 : 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int colorer_select_type(void* handle, const char* file_name, const char* first_line) {
     auto* session = static_cast<ColorerSession*>(handle);
     if (!session) return 0;
@@ -149,6 +225,22 @@ int colorer_get_region_end(void* handle, int index) {
 const char* colorer_get_region_name(void* handle, int index) {
     auto* session = static_cast<ColorerSession*>(handle);
     return session->region_handler.regions[index].name;
+}
+
+unsigned int colorer_get_region_fore(void* handle, int index) {
+    return static_cast<ColorerSession*>(handle)->region_handler.regions[index].fore;
+}
+unsigned int colorer_get_region_back(void* handle, int index) {
+    return static_cast<ColorerSession*>(handle)->region_handler.regions[index].back;
+}
+unsigned int colorer_get_region_style(void* handle, int index) {
+    return static_cast<ColorerSession*>(handle)->region_handler.regions[index].style;
+}
+int colorer_get_region_is_fore_set(void* handle, int index) {
+    return static_cast<ColorerSession*>(handle)->region_handler.regions[index].isForeSet;
+}
+int colorer_get_region_is_back_set(void* handle, int index) {
+    return static_cast<ColorerSession*>(handle)->region_handler.regions[index].isBackSet;
 }
 
 }

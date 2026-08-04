@@ -39,9 +39,27 @@ func sharedCompilationCache() wazero.CompilationCache {
 }
 
 type Region struct {
-	Start int
-	End   int
-	Name  string
+	Start     int
+	End       int
+	Name      string
+	Fore      uint32
+	Back      uint32
+	Style     uint32
+	IsForeSet bool
+	IsBackSet bool
+}
+
+type RegionDefine struct {
+	Fore      uint32
+	Back      uint32
+	Style     uint32
+	IsForeSet bool
+	IsBackSet bool
+}
+
+type HRDInstance struct {
+	Name        string
+	Description string
 }
 
 type Session struct {
@@ -147,6 +165,113 @@ func (s *Session) Close() {
 	s.r.Close(s.ctx)
 }
 
+func (s *Session) SetHRD(hrdClass, hrdName string) error {
+	allocFn := s.mod.ExportedFunction("colorer_alloc")
+	freeFn := s.mod.ExportedFunction("colorer_free")
+	setHrdFn := s.mod.ExportedFunction("colorer_set_hrd")
+
+	cBytes := append([]byte(hrdClass), 0)
+	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	if err != nil {
+		return err
+	}
+	cPtr := uint32(cRes[0])
+	defer freeFn.Call(s.ctx, uint64(cPtr))
+	s.mod.Memory().Write(cPtr, cBytes)
+
+	nBytes := append([]byte(hrdName), 0)
+	nRes, err := allocFn.Call(s.ctx, uint64(len(nBytes)))
+	if err != nil {
+		return err
+	}
+	nPtr := uint32(nRes[0])
+	defer freeFn.Call(s.ctx, uint64(nPtr))
+	s.mod.Memory().Write(nPtr, nBytes)
+
+	ret, err := setHrdFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr), uint64(nPtr))
+	if err != nil || ret[0] == 0 {
+		return errors.New("colorer_set_hrd failed")
+	}
+	return nil
+}
+
+func (s *Session) EnumHRDInstances(classID string) ([]HRDInstance, error) {
+	allocFn := s.mod.ExportedFunction("colorer_alloc")
+	freeFn := s.mod.ExportedFunction("colorer_free")
+	enumFn := s.mod.ExportedFunction("colorer_enum_hrd_instances")
+	getNameFn := s.mod.ExportedFunction("colorer_get_hrd_name")
+	getDescFn := s.mod.ExportedFunction("colorer_get_hrd_description")
+
+	cBytes := append([]byte(classID), 0)
+	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	if err != nil {
+		return nil, err
+	}
+	cPtr := uint32(cRes[0])
+	defer freeFn.Call(s.ctx, uint64(cPtr))
+	s.mod.Memory().Write(cPtr, cBytes)
+
+	ret, err := enumFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr))
+	if err != nil {
+		return nil, err
+	}
+	count := int(ret[0])
+	var instances []HRDInstance
+	for i := 0; i < count; i++ {
+		namePtr, _ := getNameFn.Call(s.ctx, uint64(s.ptr), uint64(i))
+		nameStr, _ := readString(s.mod.Memory(), uint32(namePtr[0]))
+		descPtr, _ := getDescFn.Call(s.ctx, uint64(s.ptr), uint64(i))
+		descStr, _ := readString(s.mod.Memory(), uint32(descPtr[0]))
+		instances = append(instances, HRDInstance{Name: nameStr, Description: descStr})
+	}
+	return instances, nil
+}
+
+func (s *Session) GetRegionDefine(name string) (*RegionDefine, error) {
+	allocFn := s.mod.ExportedFunction("colorer_alloc")
+	freeFn := s.mod.ExportedFunction("colorer_free")
+	getRdFn := s.mod.ExportedFunction("colorer_get_region_define")
+
+	cBytes := append([]byte(name), 0)
+	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	if err != nil {
+		return nil, err
+	}
+	cPtr := uint32(cRes[0])
+	defer freeFn.Call(s.ctx, uint64(cPtr))
+	s.mod.Memory().Write(cPtr, cBytes)
+
+	resPtrBlock, err := allocFn.Call(s.ctx, 20)
+	if err != nil {
+		return nil, err
+	}
+	pFore := uint32(resPtrBlock[0])
+	pBack := pFore + 4
+	pStyle := pFore + 8
+	pIsForeSet := pFore + 12
+	pIsBackSet := pFore + 16
+	defer freeFn.Call(s.ctx, uint64(pFore))
+
+	ret, err := getRdFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr), uint64(pFore), uint64(pBack), uint64(pStyle), uint64(pIsForeSet), uint64(pIsBackSet))
+	if err != nil || ret[0] == 0 {
+		return nil, errors.New("region not found")
+	}
+
+	fore, _ := s.mod.Memory().ReadUint32Le(pFore)
+	back, _ := s.mod.Memory().ReadUint32Le(pBack)
+	style, _ := s.mod.Memory().ReadUint32Le(pStyle)
+	isForeSet, _ := s.mod.Memory().ReadUint32Le(pIsForeSet)
+	isBackSet, _ := s.mod.Memory().ReadUint32Le(pIsBackSet)
+
+	return &RegionDefine{
+		Fore:      fore,
+		Back:      back,
+		Style:     style,
+		IsForeSet: isForeSet != 0,
+		IsBackSet: isBackSet != 0,
+	}, nil
+}
+
 func (s *Session) SelectType(fileName, firstLine string) (bool, error) {
 	allocFn := s.mod.ExportedFunction("colorer_alloc")
 	freeFn := s.mod.ExportedFunction("colorer_free")
@@ -205,22 +330,36 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 	getStart := s.mod.ExportedFunction("colorer_get_region_start")
 	getEnd := s.mod.ExportedFunction("colorer_get_region_end")
 	getName := s.mod.ExportedFunction("colorer_get_region_name")
+	getFore := s.mod.ExportedFunction("colorer_get_region_fore")
+	getBack := s.mod.ExportedFunction("colorer_get_region_back")
+	getStyle := s.mod.ExportedFunction("colorer_get_region_style")
+	getIsForeSet := s.mod.ExportedFunction("colorer_get_region_is_fore_set")
+	getIsBackSet := s.mod.ExportedFunction("colorer_get_region_is_back_set")
 
 	for i := 0; i < count; i++ {
 		rStart, _ := getStart.Call(s.ctx, uint64(s.ptr), uint64(i))
 		rEnd, _ := getEnd.Call(s.ctx, uint64(s.ptr), uint64(i))
 		rNamePtr, _ := getName.Call(s.ctx, uint64(s.ptr), uint64(i))
+		rFore, _ := getFore.Call(s.ctx, uint64(s.ptr), uint64(i))
+		rBack, _ := getBack.Call(s.ctx, uint64(s.ptr), uint64(i))
+		rStyle, _ := getStyle.Call(s.ctx, uint64(s.ptr), uint64(i))
+		rIsForeSet, _ := getIsForeSet.Call(s.ctx, uint64(s.ptr), uint64(i))
+		rIsBackSet, _ := getIsBackSet.Call(s.ctx, uint64(s.ptr), uint64(i))
 
-		// Read the region classification name from WASM memory up to the null-terminator
 		nameStr, err := readString(s.mod.Memory(), uint32(rNamePtr[0]))
 		if err != nil {
 			return nil, err
 		}
 
 		regions[i] = Region{
-			Start: int(rStart[0]),
-			End:   int(rEnd[0]),
-			Name:  nameStr,
+			Start:     int(rStart[0]),
+			End:       int(int32(rEnd[0])),
+			Name:      nameStr,
+			Fore:      uint32(rFore[0]),
+			Back:      uint32(rBack[0]),
+			Style:     uint32(rStyle[0]),
+			IsForeSet: rIsForeSet[0] != 0,
+			IsBackSet: rIsBackSet[0] != 0,
 		}
 	}
 
