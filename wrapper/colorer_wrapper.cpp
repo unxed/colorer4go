@@ -44,13 +44,22 @@ public:
     void harvest(size_t lno) {
         regions.clear();
         for (LineRegion* lr = getLineRegions(lno); lr != nullptr; lr = lr->next) {
-            if (lr->special || lr->region == nullptr) {
+            if (lr->special) {
                 continue;
             }
-            if (name_cache.find(lr->region) == name_cache.end()) {
-                name_cache[lr->region] = UStr::to_stdstr(&lr->region->getName());
+            if (lr->region == nullptr && lr->rdef == nullptr) {
+                continue;
             }
-
+            
+            const char* name = "";
+            if (lr->region != nullptr) {
+                if (name_cache.find(lr->region) == name_cache.end()) {
+                    name_cache[lr->region] = UStr::to_stdstr(&lr->region->getName());
+                }
+                name = name_cache[lr->region].c_str();
+            }
+            int end_idx = lr->end;
+            
             unsigned int fore = 0, back = 0, style = 0;
             int isForeSet = 0, isBackSet = 0;
             if (lr->rdef) {
@@ -65,9 +74,7 @@ public:
             }
 
             regions.push_back({
-                lr->start,
-                lr->end,
-                name_cache[lr->region].c_str(),
+                lr->start, end_idx, name,
                 fore, back, style, isForeSet, isBackSet
             });
         }
