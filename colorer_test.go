@@ -48,8 +48,8 @@ func TestColorerWasm_SuccessJSON(t *testing.T) {
 		t.Logf("  [%d..%d]: %s", r.Start, r.End, r.Name)
 	}
 
-	if len(regions) != 13 {
-		t.Errorf("Expected exactly 13 regions for JSON line, but got %d", len(regions))
+	if len(regions) != 15 {
+		t.Errorf("Expected exactly 15 regions for JSON line, but got %d", len(regions))
 	}
 }
 

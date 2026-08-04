@@ -45,10 +45,10 @@ type Region struct {
 }
 
 type Session struct {
-	ctx  context.Context
-	r    wazero.Runtime
-	mod  api.Module
-	ptr  uint32 // Pointer to the ColorerSession struct in C++
+	ctx context.Context
+	r   wazero.Runtime
+	mod api.Module
+	ptr uint32 // Pointer to the ColorerSession struct in C++
 }
 
 // NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM
@@ -133,10 +133,10 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 	}
 
 	return &Session{
-		ctx:  ctx,
-		r:    r,
-		mod:  mod,
-		ptr:  uint32(res[0]),
+		ctx: ctx,
+		r:   r,
+		mod: mod,
+		ptr: uint32(res[0]),
 	}, nil
 }
 

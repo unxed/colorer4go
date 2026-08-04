@@ -2,7 +2,7 @@
 #include <colorer/ParserFactory.h>
 #include <colorer/TextParser.h>
 #include <colorer/LineSource.h>
-#include <colorer/RegionHandler.h>
+#include <colorer/handlers/LineRegionsSupport.h>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -22,27 +22,44 @@ public:
     }
 };
 
-class WasmRegionHandler : public RegionHandler {
+class WasmRegionHandler : public LineRegionsSupport {
 public:
     std::vector<WasmRegion> regions;
     std::unordered_map<const Region*, std::string>& name_cache;
+    WasmLineSource* line_source = nullptr;
 
     WasmRegionHandler(std::unordered_map<const Region*, std::string>& cache)
         : name_cache(cache) {}
 
     void clear() {
         regions.clear();
+        LineRegionsSupport::clear();
     }
 
-    void addRegion(size_t /*lno*/, UnicodeString* /*line*/, int sx, int ex, const Region* region) override {
-        if (!region) return;
-        if (name_cache.find(region) == name_cache.end()) {
-            name_cache[region] = UStr::to_stdstr(&region->getName());
+    void harvest(size_t lno) {
+        regions.clear();
+        for (LineRegion* lr = getLineRegions(lno); lr != nullptr; lr = lr->next) {
+            if (lr->special || lr->region == nullptr) {
+                continue;
+            }
+            const Region* region = lr->region;
+            if (name_cache.find(region) == name_cache.end()) {
+                std::string chain = UStr::to_stdstr(&region->getName());
+                const Region* p = region->getParent();
+                while (p) {
+                    chain += "|";
+                    chain += UStr::to_stdstr(&p->getName());
+                    p = p->getParent();
+                }
+                name_cache[region] = chain;
+            }
+            int end_idx = lr->end;
+            if (end_idx == -1) {
+                end_idx = line_source->lines[lno].length();
+            }
+            regions.push_back({lr->start, end_idx, name_cache[region].c_str()});
         }
-        regions.push_back({sx, ex, name_cache[region].c_str()});
     }
-    void enterScheme(size_t /*lno*/, UnicodeString* /*line*/, int /*sx*/, int /*ex*/, const Region* /*region*/, const Scheme* /*scheme*/) override {}
-    void leaveScheme(size_t /*lno*/, UnicodeString* /*line*/, int /*sx*/, int /*ex*/, const Region* /*region*/, const Scheme* /*scheme*/) override {}
 };
 
 struct ColorerSession {
@@ -67,6 +84,8 @@ void colorer_free(void* ptr) {
 
 void* colorer_init(const char* catalog_path) {
     ColorerSession* session = new ColorerSession();
+    session->region_handler.line_source = &session->line_source;
+    session->region_handler.resize(1);
     session->factory = std::make_unique<ParserFactory>();
     UnicodeString cat(catalog_path);
     session->factory->loadCatalog(&cat);
@@ -111,7 +130,9 @@ int colorer_parse_line(void* handle, const char* line_utf8, int line_len) {
     size_t lno = session->line_source.lines.size();
     session->line_source.lines.push_back(UnicodeString(line_utf8, line_len, Encodings::ENC_UTF8));
 
+    session->region_handler.setFirstLine(lno);
     session->parser->parse(lno, 1, TextParser::TextParseMode::TPM_CACHE_UPDATE);
+    session->region_handler.harvest(lno);
     return session->region_handler.regions.size();
 }
 
