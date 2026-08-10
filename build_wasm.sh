@@ -1,4 +1,9 @@
 #!/bin/bash
+
+#
+# BINARYEN_PATH=/opt/binaryen WASI_SDK_PATH=/opt/wasi-sdk ./build_wasm.sh
+#
+
 set -e
 
 if [ -z "$WASI_SDK_PATH" ]; then
