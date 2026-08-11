@@ -1,4 +1,3 @@
-#include "colorer/Common.h"
 #include "colorer/common/Logger.h"
 
 Logger* Log::logger = nullptr;

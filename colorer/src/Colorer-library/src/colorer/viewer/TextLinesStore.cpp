@@ -45,7 +45,7 @@ void TextLinesStore::loadFile(const UnicodeString* inFileName, bool tab2spaces)
       data = is->openStream();
     } catch (InputSourceException&) {
       delete is;
-      ((void)0);
+      throw;
     }
     file = Encodings::toUnicodeString((char*) data, (int32_t) is->length());
     delete is;
