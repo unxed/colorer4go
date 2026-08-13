@@ -20,12 +20,4 @@
 */
 #include "colorer/common/Logger.h"
 
-#if !defined(__EXCEPTIONS) && !defined(__cpp_exceptions) && !defined(_CPPUNWIND)
-#include <cstdlib>
-#include <exception>
-#define throw ::abort(),
-#define try if(true)
-#define catch(...) for (std::exception e; false; )
-#endif
-
 #endif  // COLORER_COMMON_H
