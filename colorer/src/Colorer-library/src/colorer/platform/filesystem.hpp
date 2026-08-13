@@ -56,7 +56,7 @@
 #define GHC_OS_SYS5R4
 #elif defined(BSD)
 #define GHC_OS_BSD
-#elif defined(__EMSCRIPTEN__)
+#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
 #define GHC_OS_WEB
 #include <wasi/api.h>
 #elif defined(__QNX__)
