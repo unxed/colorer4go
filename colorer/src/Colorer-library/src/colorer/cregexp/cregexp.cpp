@@ -3,8 +3,32 @@
 
 StackElem* CRegExp::RegExpStack {nullptr};
 int CRegExp::RegExpStack_Size {0};
+
+
 /////////////////////////////////////////////////////////////////////////////
-//
+
+
+void SMatches::topseSanitize(int cur)
+{
+    while (topse < cur) {
+      ++topse;
+      s[topse] = -1;
+      e[topse] = -1;
+    }
+}
+
+#if !defined NAMED_MATCHES_IN_HASH
+void SMatches::topnseSanitize(int cur)
+{
+    while (topnse < cur) {
+      ++topnse;
+      ns[topnse] = -1;
+      ne[topnse] = -1;
+    }
+}
+#endif
+
+
 SRegInfo::SRegInfo()
 {
   un.param = nullptr;
@@ -41,7 +65,7 @@ void CRegExp::init()
   tree_root = nullptr;
   positionMoves = false;
   error = EError::EERROR;
-  firstChar = 0;
+  firstNode = nullptr;
   cMatch = 0;
   global_pattern = nullptr;
 #ifdef COLORERMODE
@@ -145,30 +169,40 @@ EError CRegExp::setRELow(const UnicodeString& expr)
 void CRegExp::optimize()
 {
   SRegInfo* next = tree_root;
-  firstChar = BAD_WCHAR;
-  firstMetaChar = EMetaSymbols::ReBadMeta;
+  firstNode = nullptr;
   while (next) {
     if (next->op == EOps::ReBrackets) {
       next = next->un.param;
       continue;
     }
-    /*    if (next->op == EOps::ReMetaSymb &&
-            next->un.metaSymbol >= ReWBound && next->un.metaSymbol < ReChrLast){
+    if (next->op == EOps::ReAhead || next->op == EOps::ReNAhead ||
+        next->op == EOps::ReBehind || next->op == EOps::ReNBehind) {
+      next = next->next;
+      continue;
+    }
+    if (next->op == EOps::ReMetaSymb) {
+      firstNode = next;
+      switch (next->un.metaSymbol) {
+        case EMetaSymbols::ReSoL:
+        case EMetaSymbols::ReEoL:
+        case EMetaSymbols::ReWBound:
+        case EMetaSymbols::ReNWBound:
+        case EMetaSymbols::RePreNW:
+#ifdef COLORERMODE
+        case EMetaSymbols::ReSoScheme:
+        case EMetaSymbols::ReStart:
+        case EMetaSymbols::ReEnd:
+#endif
           next = next->next;
           continue;
-        };*/
-    if (next->op == EOps::ReMetaSymb) {
-      if (next->un.metaSymbol != EMetaSymbols::ReSoL && next->un.metaSymbol != EMetaSymbols::ReWBound)
-        break;
-      firstMetaChar = next->un.metaSymbol;
+        default:
+          break;
+      }
       break;
     }
-    if (next->op == EOps::ReSymb) {
-      firstChar = next->un.symbol;
-      break;
-    }
-    if (next->op == EOps::ReWord) {
-      firstChar = (*next->un.word)[0];
+    if (next->op == EOps::ReSymb || next->op == EOps::ReWord ||
+        next->op == EOps::ReEnum || next->op == EOps::ReNEnum) {
+      firstNode = next;
     }
     break;
   }
@@ -671,19 +705,16 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
 // parsing
 ////////////////////////////////////////////////////////////////////////////
 
+static bool isLineBreak(wchar_t c)
+{
+   return c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x85 || c == 0x2028 || c == 0x2029;
+}
+
 bool CRegExp::isWordBoundary(int toParse)
 {
-  int before = 0;
-  int after = 0;
-  if (toParse < end && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse]))
-    after = 1;
-  if (toParse > 0 && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse - 1]))
-    before = 1;
-  return before + after == 1;
-}
-bool CRegExp::isNWordBoundary(int toParse)
-{
-  return !isWordBoundary(toParse);
+  const bool after = (toParse < end && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse]));
+  const bool before = (toParse > 0 && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse - 1]));
+  return before != after;
 }
 
 bool CRegExp::checkMetaSymbol(EMetaSymbols symb, int& toParse)
@@ -692,97 +723,89 @@ bool CRegExp::checkMetaSymbol(EMetaSymbols symb, int& toParse)
 
   switch (symb) {
     case EMetaSymbols::ReAnyChr:
-      if (toParse >= end)
-        return false;
-      if (!singleLine &&
-          (pattern[toParse] == 0x0A || pattern[toParse] == 0x0B || pattern[toParse] == 0x0C ||
-           pattern[toParse] == 0x0D || pattern[toParse] == 0x85 || pattern[toParse] == 0x2028 ||
-           pattern[toParse] == 0x2029))
+      if (toParse >= end || (!singleLine && isLineBreak(pattern[toParse])))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReSoL:
-      if (multiLine) {
-        bool ok = false;
-        if (toParse &&
-            (pattern[toParse - 1] == 0x0A || pattern[toParse - 1] == 0x0B || pattern[toParse - 1] == 0x0C ||
-             pattern[toParse - 1] == 0x0D || pattern[toParse - 1] == 0x85 || pattern[toParse - 1] == 0x2028 ||
-             pattern[toParse - 1] == 0x2029))
-          ok = true;
-        return (toParse == 0 || ok);
-      }
-      return (toParse == 0);
+        return toParse == 0 || (multiLine && isLineBreak(pattern[toParse - 1]));
+
     case EMetaSymbols::ReEoL:
-      if (multiLine) {
-        bool ok = false;  // ???check
-        if (toParse && toParse < end &&
-            (pattern[toParse - 1] == 0x0A || pattern[toParse - 1] == 0x0B || pattern[toParse - 1] == 0x0C ||
-             pattern[toParse - 1] == 0x0D || pattern[toParse - 1] == 0x85 || pattern[toParse - 1] == 0x2028 ||
-             pattern[toParse - 1] == 0x2029))
-          ok = true;
-        return (toParse == end || ok);
-      }
-      return (end == toParse);
+      return toParse == end || (multiLine && toParse && toParse < end && isLineBreak(pattern[toParse - 1]));
+
     case EMetaSymbols::ReDigit:
       if (toParse >= end || !Character::isDigit(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReNDigit:
       if (toParse >= end || Character::isDigit(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReWordSymb:
       if (toParse >= end || !Character::isLetterOrDigitOrUnderscore(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReNWordSymb:
       if (toParse >= end || Character::isLetterOrDigitOrUnderscore(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReWSpace:
       if (toParse >= end || !Character::isWhitespace(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReNWSpace:
       if (toParse >= end || Character::isWhitespace(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReUCase:
       if (toParse >= end || !Character::isUpperCase(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReNUCase:
       if (toParse >= end || !Character::isLowerCase(pattern[toParse]))
         return false;
       toParse++;
       return true;
+
     case EMetaSymbols::ReWBound:
       return isWordBoundary(toParse);
+
     case EMetaSymbols::ReNWBound:
-      return isNWordBoundary(toParse);
+      return !isWordBoundary(toParse);
+
     case EMetaSymbols::RePreNW:
-      if (toParse >= end)
-        return true;
-      return toParse == 0 || !Character::isLetter(pattern[toParse - 1]);
+      return toParse == 0 || toParse >= end || !Character::isLetter(pattern[toParse - 1]);
+
 #ifdef COLORERMODE
     case EMetaSymbols::ReSoScheme:
       return (schemeStart == toParse);
+
     case EMetaSymbols::ReStart:
       matches->s[0] = toParse;
       startChange = true;
       return true;
+
     case EMetaSymbols::ReEnd:
       matches->e[0] = toParse;
       endChange = true;
       return true;
 #endif
+
     default:
       return false;
   }
@@ -872,6 +895,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             if (re->param0 == -1)
               break;
             if (re->op == EOps::ReBrackets) {
+              matches->topseSanitize(re->param0);
               if (re->param0 || !startChange)
                 matches->s[re->param0] = re->s;
               if (re->param0 || !endChange)
@@ -881,6 +905,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             }
             else {
 #ifndef NAMED_MATCHES_IN_HASH
+              matches->topnseSanitize(re->param0);
               matches->ns[re->param0] = re->s;
               matches->ne[re->param0] = toParse;
               if (matches->ne[re->param0] < matches->ns[re->param0])
@@ -1055,6 +1080,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               check_stack(false, &re, &prev, &toParse, &leftenter, &action);
               continue;
             }
+            matches->topnseSanitize(sv);
             if (matches->ns[sv] == -1 || matches->ne[sv] == -1) {
               check_stack(false, &re, &prev, &toParse, &leftenter, &action);
               continue;
@@ -1102,6 +1128,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               check_stack(false, &re, &prev, &toParse, &leftenter, &action);
               continue;
             }
+            matches->topseSanitize(sv);
             if (matches->s[sv] == -1 || matches->e[sv] == -1) {
               check_stack(false, &re, &prev, &toParse, &leftenter, &action);
               continue;
@@ -1342,46 +1369,76 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
   }
 }
 
+bool CRegExp::canStartWith(wchar ch) const
+{
+  if (!firstNode) {
+    return true;
+  }
+  switch (firstNode->op) {
+    case EOps::ReSymb:
+      return matchChars(ch, firstNode->un.symbol);
+    case EOps::ReWord:
+      return matchChars(ch, (*firstNode->un.word)[0]);
+    case EOps::ReEnum:
+      return firstNode->un.charclass->contains(ch);
+    case EOps::ReNEnum:
+      return !firstNode->un.charclass->contains(ch);
+    case EOps::ReMetaSymb:
+      switch (firstNode->un.metaSymbol) {
+        case EMetaSymbols::ReAnyChr:
+          return singleLine || !isLineBreak(ch);
+        case EMetaSymbols::ReDigit:
+          return Character::isDigit(ch);
+        case EMetaSymbols::ReNDigit:
+          return !Character::isDigit(ch);
+        case EMetaSymbols::ReWordSymb:
+          return Character::isLetterOrDigitOrUnderscore(ch);
+        case EMetaSymbols::ReNWordSymb:
+          return !Character::isLetterOrDigitOrUnderscore(ch);
+        case EMetaSymbols::ReWSpace:
+          return Character::isWhitespace(ch);
+        case EMetaSymbols::ReNWSpace:
+          return !Character::isWhitespace(ch);
+        case EMetaSymbols::ReUCase:
+          return Character::isUpperCase(ch);
+        case EMetaSymbols::ReNUCase:
+          return Character::isLowerCase(ch);
+        default:
+          return true;
+      }
+    default:
+      return true;
+  }
+}
+
 inline bool CRegExp::quickCheck(int toParse)
 {
-  if (firstChar != BAD_WCHAR) {
-    return toParse < end && matchChars((*global_pattern)[toParse], firstChar);
-  }
-  if (firstMetaChar != EMetaSymbols::ReBadMeta)
-    switch (firstMetaChar) {
-      case EMetaSymbols::ReSoL:
-        if (toParse != 0)
-          return false;
-        return true;
+  switch (firstNode->op) {
+    case EOps::ReSymb:
+      return toParse < end && matchChars((*global_pattern)[toParse], firstNode->un.symbol);
+    case EOps::ReWord:
+      return toParse < end && matchChars((*global_pattern)[toParse], (*firstNode->un.word)[0]);
+    case EOps::ReEnum:
+    case EOps::ReNEnum:
+      return toParse < end &&
+             (firstNode->un.charclass->contains((*global_pattern)[toParse]) ==
+              (firstNode->op == EOps::ReEnum));
+    case EOps::ReMetaSymb:
+      switch (firstNode->un.metaSymbol) {
 #ifdef COLORERMODE
-      case EMetaSymbols::ReSoScheme:
-        if (toParse != schemeStart)
-          return false;
-        return true;
+        case EMetaSymbols::ReStart:
+        case EMetaSymbols::ReEnd:
+          return true;
 #endif
-        //    case ReWBound:
-        //      return relocale->cl_isword(*toParse) && (toParse == start ||
-        //      !relocale->cl_isword(*(toParse-1)));
-      case EMetaSymbols::ReBadMeta:
-      case EMetaSymbols::ReAnyChr:
-      case EMetaSymbols::ReEoL:
-      case EMetaSymbols::ReDigit:
-      case EMetaSymbols::ReNDigit:
-      case EMetaSymbols::ReWordSymb:
-      case EMetaSymbols::ReNWordSymb:
-      case EMetaSymbols::ReWSpace:
-      case EMetaSymbols::ReNWSpace:
-      case EMetaSymbols::ReUCase:
-      case EMetaSymbols::ReNUCase:
-      case EMetaSymbols::ReWBound:
-      case EMetaSymbols::ReNWBound:
-      case EMetaSymbols::RePreNW:
-      case EMetaSymbols::ReStart:
-      case EMetaSymbols::ReEnd:
-      case EMetaSymbols::ReChrLast:
-        break;
-    }
-  return true;
+        case EMetaSymbols::ReBadMeta:
+        case EMetaSymbols::ReChrLast:
+          return true;
+        default:
+          return checkMetaSymbol(firstNode->un.metaSymbol, toParse);
+      }
+    default:
+      return true;
+  }
 }
 
 inline bool CRegExp::parseRE(int pos)
@@ -1391,20 +1448,23 @@ inline bool CRegExp::parseRE(int pos)
 
   int toParse = pos;
 
-  if (!positionMoves && (firstChar != BAD_WCHAR || firstMetaChar != EMetaSymbols::ReBadMeta) && !quickCheck(toParse))
+  if (!positionMoves && firstNode && !quickCheck(toParse))
     return false;
 
-  int i;
-  for (i = 0; i < cMatch; i++) matches->s[i] = matches->e[i] = -1;
+  matches->reset();
   matches->cMatch = cMatch;
 #ifndef NAMED_MATCHES_IN_HASH
-  for (i = 0; i < cnMatch; i++) matches->ns[i] = matches->ne[i] = -1;
   matches->cnMatch = cnMatch;
 #endif
   do {
     // stack=null;
-    if (lowParse(tree_root, nullptr, toParse))
+    if (lowParse(tree_root, nullptr, toParse)) {
+      matches->topseSanitize(cMatch - 1);
+#ifndef NAMED_MATCHES_IN_HASH
+      matches->topnseSanitize(cnMatch - 1);
+#endif
       return true;
+    }
     if (!positionMoves)
       return false;
     toParse = ++pos;
