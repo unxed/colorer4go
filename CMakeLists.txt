@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 project(ColorerWasm C CXX)
 
 # Globally disable C++ exceptions and preserve RTTI for dynamic_cast support in the core
-add_compile_options(-fno-exceptions -frtti)
+add_compile_options(-fno-exceptions -frtti -D__EMSCRIPTEN__ -include ${CMAKE_CURRENT_SOURCE_DIR}/wrapper/wasm_compat.h)
 
 # --- 1. Configure Dependency: LibXml2 ---
 # Download and build libxml2 as a static library for WASM
