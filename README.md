@@ -54,6 +54,25 @@ func (s *Session) ParseLine(line string) ([]Region, error)
 * `line`: A single line of UTF-8 encoded text.
 * Returns a slice of `Region` tokens.
 
+#### `func (*Session) ForgetBefore`
+Releases the stored text of every session line below `line`.
+```go
+func (s *Session) ForgetBefore(line int) error
+```
+The session numbers its lines from zero at the last `Reset`, and `ParseLine` appends at `NextLine`. Without this call every line ever parsed stays in WASM memory as UTF-16 until the session is reset, so walking a large file drags the whole file into the heap.
+
+Only lines the parser will not ask for again may be dropped. It reads forward only, so everything below the next line to be parsed is safe; keeping a margin of a few lines below the region of interest is safer still. Dropping a line and then parsing it again traps the module: that surfaces as an error from `ParseLine` and leaves the session unusable.
+
+The call is clamped and idempotent — lines already dropped and lines not yet parsed are ignored.
+
+#### `func (*Session) FirstLine` and `func (*Session) NextLine`
+The two bounds of the window of lines the session still holds.
+```go
+func (s *Session) FirstLine() (int, error)
+func (s *Session) NextLine() (int, error)
+```
+`FirstLine` is the oldest line still stored — zero until `ForgetBefore` is called. `NextLine` is the number the next line passed to `ParseLine` will get, i.e. the count of lines fed since the last `Reset`.
+
 #### `func (*Session) Reset`
 Resets the session's internal line-state cache and clears stored lines. Call this when you want to start parsing a completely new file within the same session.
 ```go
@@ -111,6 +130,18 @@ func main() {
 	}
 }
 ```
+
+---
+
+## Memory Model of a Session
+
+A session accumulates two things as it parses, and they are released differently.
+
+**The lines themselves** are held by `WasmLineSource` in the wrapper as a deque of UTF-16 strings, indexed by absolute line number through a `base` offset. `ForgetBefore` pops the front of that deque, which frees each line's buffer immediately. This is the part that scales with file size — a 40 MB source file is about 80 MB of WASM heap if nothing is ever dropped.
+
+**The parse cache** inside libcolorer's `TextParser` holds one node per multi-line block that is still open, plus a copy of the line that opened it. It is bounded by the nesting structure of the file rather than by its length, and there is no way to trim it short of `Reset`, which drops the parse position with it. Making it trimmable, or snapshottable, would be a change to libcolorer itself and not to this wrapper.
+
+So: `ForgetBefore` is what makes a long forward walk cost bounded memory; `Reset` remains the only way to release the parse cache, at the price of the context it holds.
 
 ---
 

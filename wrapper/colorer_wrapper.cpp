@@ -3,9 +3,11 @@
 #include <colorer/TextParser.h>
 #include <colorer/LineSource.h>
 #include <colorer/handlers/LineRegionsSupport.h>
+#include <deque>
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 struct WasmRegion {
     int start;
@@ -18,12 +20,54 @@ struct WasmRegion {
     int isBackSet;
 };
 
+// Sliding window of the lines fed to the session.
+//
+// Lines are numbered absolutely, from the first line ever fed after a reset:
+// `base` is the number of the oldest line still stored, so line `lno` lives at
+// `lines[lno - base]`. Trimming the front of the window is what keeps a long
+// forward scroll from accumulating the whole file in wasm memory as UTF-16.
+//
+// Safe to trim because the parser only ever reads forward: TextParser::parse()
+// positions itself through the parse cache (which keeps its own copy of the
+// line that opened a block, see ParseCache::backLine) and colorize() then walks
+// getLine() from `from` upwards. A line below the next line to be parsed will
+// not be asked for again. Asking for a dropped line is fatal, not merely wrong:
+// getLine() returning nullptr makes the parser throw, and with -fno-exceptions
+// that is abort() and a trapped module.
 class WasmLineSource : public LineSource {
 public:
-    std::vector<UnicodeString> lines;
+    std::deque<UnicodeString> lines;
+    size_t base = 0;
+
+    // Number of the oldest line still stored.
+    size_t firstLine() const { return base; }
+    // Number the next line fed to the session will get.
+    size_t nextLine() const { return base + lines.size(); }
+
+    void append(UnicodeString&& line) {
+        lines.push_back(std::move(line));
+    }
+
+    // Drops the stored text of every line below `lno`. Idempotent, and clamped
+    // at both ends: lines already dropped and lines not yet fed are ignored.
+    void forgetBefore(size_t lno) {
+        if (lno <= base) return;
+        size_t drop = lno - base;
+        if (drop > lines.size()) drop = lines.size();
+        lines.erase(lines.begin(), lines.begin() + static_cast<ptrdiff_t>(drop));
+        base += drop;
+    }
+
+    void clear() {
+        lines.clear();
+        base = 0;
+    }
+
     UnicodeString* getLine(size_t lno) override {
-        if (lno >= lines.size()) return nullptr;
-        return &lines[lno];
+        if (lno < base) return nullptr;
+        size_t idx = lno - base;
+        if (idx >= lines.size()) return nullptr;
+        return &lines[idx];
     }
 };
 
@@ -128,7 +172,7 @@ void colorer_destroy(void* handle) {
 void colorer_reset_session(void* handle) {
     auto* session = static_cast<ColorerSession*>(handle);
     if (session) {
-        session->line_source.lines.clear();
+        session->line_source.clear();
         session->parser->clearCache();
         session->region_handler.clear();
     }
@@ -210,13 +254,31 @@ int colorer_parse_line(void* handle, const char* line_utf8, int line_len) {
     if (!session) return -1;
     session->region_handler.clear();
 
-    size_t lno = session->line_source.lines.size();
-    session->line_source.lines.push_back(UnicodeString(line_utf8, line_len, Encodings::ENC_UTF8));
+    size_t lno = session->line_source.nextLine();
+    session->line_source.append(UnicodeString(line_utf8, line_len, Encodings::ENC_UTF8));
 
     session->region_handler.setFirstLine(lno);
     session->parser->parse(lno, 1, TextParser::TextParseMode::TPM_CACHE_UPDATE);
     session->region_handler.harvest(lno);
     return session->region_handler.regions.size();
+}
+
+void colorer_forget_before(void* handle, int lno) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || lno <= 0) return;
+    session->line_source.forgetBefore(static_cast<size_t>(lno));
+}
+
+int colorer_first_line(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return -1;
+    return static_cast<int>(session->line_source.firstLine());
+}
+
+int colorer_next_line(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return -1;
+    return static_cast<int>(session->line_source.nextLine());
 }
 
 int colorer_get_region_start(void* handle, int index) {

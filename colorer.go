@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -368,6 +369,67 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 
 func (s *Session) Reset() {
 	s.mod.ExportedFunction("colorer_reset_session").Call(s.ctx, uint64(s.ptr))
+}
+
+// exportedFn looks a function up in the module and says what to do when the
+// embedded colorer.wasm is older than this Go code.
+func (s *Session) exportedFn(name string) (api.Function, error) {
+	fn := s.mod.ExportedFunction(name)
+	if fn == nil {
+		return nil, fmt.Errorf("%s is not exported by the embedded colorer.wasm; rebuild it with ./build_wasm.sh", name)
+	}
+	return fn, nil
+}
+
+// ForgetBefore releases the stored text of every session line below line.
+//
+// The session numbers lines from zero at the last Reset; ParseLine appends at
+// NextLine. Without this call every line ever parsed stays in wasm memory as
+// UTF-16 until the session is reset, so scrolling through a large file drags
+// the whole file into the heap.
+//
+// Only lines the parser will not ask for again may be dropped. It reads
+// forward only, so anything below the next line to be parsed is safe; a
+// caller that keeps a margin below the viewport is safer still. Dropping a
+// line and then parsing it again traps the module, which surfaces as an error
+// from ParseLine and leaves the session unusable.
+//
+// The call is clamped and idempotent: lines already dropped and lines not yet
+// parsed are ignored.
+func (s *Session) ForgetBefore(line int) error {
+	fn, err := s.exportedFn("colorer_forget_before")
+	if err != nil {
+		return err
+	}
+	if line < 0 {
+		line = 0
+	}
+	_, err = fn.Call(s.ctx, uint64(s.ptr), uint64(uint32(line)))
+	return err
+}
+
+// FirstLine is the number of the oldest line the session still holds. It is
+// zero until ForgetBefore is called, and returns to zero on Reset.
+func (s *Session) FirstLine() (int, error) {
+	return s.lineBound("colorer_first_line")
+}
+
+// NextLine is the number the next line passed to ParseLine will get, i.e. the
+// count of lines fed since the last Reset.
+func (s *Session) NextLine() (int, error) {
+	return s.lineBound("colorer_next_line")
+}
+
+func (s *Session) lineBound(name string) (int, error) {
+	fn, err := s.exportedFn(name)
+	if err != nil {
+		return 0, err
+	}
+	res, err := fn.Call(s.ctx, uint64(s.ptr))
+	if err != nil {
+		return 0, err
+	}
+	return int(int32(res[0])), nil
 }
 
 func readString(mem api.Memory, offset uint32) (string, error) {
