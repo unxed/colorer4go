@@ -137,6 +137,13 @@ struct ColorerSession {
     std::string last_hrd_name;
     std::string last_hrd_desc;
 
+    // Reused across colorer_parse_line calls so a session that has already
+    // seen a line at least this long does not pay for a malloc/free pair on
+    // every subsequent one. Only grows: parse_line copies the bytes into a
+    // UnicodeString before returning, so nothing needs to survive past that
+    // call and there is nothing to shrink for.
+    std::vector<char> line_buffer;
+
     ColorerSession() : region_handler(name_cache) {}
 };
 
@@ -148,6 +155,22 @@ void* colorer_alloc(size_t size) {
 
 void colorer_free(void* ptr) {
     free(ptr);
+}
+
+// Returns a pointer into the session's own line buffer, grown to at least
+// min_size bytes if it wasn't already that big. The caller writes the line's
+// UTF-8 bytes there and passes the same pointer straight to
+// colorer_parse_line — this is what colorer_alloc/colorer_free used to be
+// called for on every single line, and it needed neither: the buffer is
+// reused, not owned per call. Returns nullptr for a bad handle or a
+// negative size.
+char* colorer_line_buffer(void* handle, int min_size) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || min_size < 0) return nullptr;
+    if (static_cast<size_t>(min_size) > session->line_buffer.size()) {
+        session->line_buffer.resize(static_cast<size_t>(min_size));
+    }
+    return session->line_buffer.data();
 }
 
 void* colorer_init(const char* catalog_path) {

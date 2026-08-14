@@ -9,6 +9,7 @@ extern "C" {
 
 __attribute__((used)) void* colorer_alloc(size_t size);
 __attribute__((used)) void colorer_free(void* ptr);
+__attribute__((used)) char* colorer_line_buffer(void* handle, int min_size);
 __attribute__((used)) void* colorer_init(const char* catalog_path);
 __attribute__((used)) void colorer_destroy(void* handle);
 __attribute__((used)) void colorer_reset_session(void* handle);

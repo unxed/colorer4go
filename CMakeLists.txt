@@ -124,6 +124,7 @@ target_link_options(
         "-Wl,--export-dynamic"
         "-Wl,--export=colorer_alloc"
         "-Wl,--export=colorer_free"
+        "-Wl,--export=colorer_line_buffer"
         "-Wl,--export=colorer_init"
         "-Wl,--export=colorer_destroy"
         "-Wl,--export=colorer_reset_session"

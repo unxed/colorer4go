@@ -70,6 +70,17 @@ type Session struct {
 	mod api.Module
 	ptr uint32 // Pointer to the ColorerSession struct in C++
 
+	// Cached once per session instead of re-resolved by name on every
+	// ParseLine call. ExportedFunction is a lookup by string key; parsing a
+	// file line by line turns a per-call lookup into millions of repeated
+	// ones for names that never change for the life of the session. The
+	// other exported functions (SetHrd, SelectType, and so on) are called
+	// rarely enough — once per file open or theme switch — that caching
+	// them would add fields without a difference anyone would feel.
+	lineBufferFn api.Function
+	parseLineFn  api.Function
+	getRegionsFn api.Function
+
 	// nameCache maps a region name's wasm pointer to the Go string already
 	// read from it. The wrapper's own name_cache (colorer_wrapper.cpp) keeps
 	// that pointer stable for the life of the session — schemas load once,
@@ -160,12 +171,16 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 		return nil, errors.New("colorer_init returned null pointer")
 	}
 
-	return &Session{
+	s := &Session{
 		ctx: ctx,
 		r:   r,
 		mod: mod,
 		ptr: uint32(res[0]),
-	}, nil
+	}
+	s.lineBufferFn = mod.ExportedFunction("colorer_line_buffer")
+	s.parseLineFn = mod.ExportedFunction("colorer_parse_line")
+	s.getRegionsFn = mod.ExportedFunction("colorer_get_regions")
+	return s, nil
 }
 
 func (s *Session) Close() {
@@ -318,20 +333,24 @@ func (s *Session) SelectType(fileName, firstLine string) (bool, error) {
 const wasmRegionSize = 32
 
 func (s *Session) ParseLine(line string) ([]Region, error) {
-	allocFn := s.mod.ExportedFunction("colorer_alloc")
-	freeFn := s.mod.ExportedFunction("colorer_free")
-	parseFn := s.mod.ExportedFunction("colorer_parse_line")
+	if s.lineBufferFn == nil {
+		return nil, errors.New("colorer_line_buffer is not exported by the embedded colorer.wasm; rebuild it with ./build_wasm.sh")
+	}
 
 	lineBytes := []byte(line)
-	res, err := allocFn.Call(s.ctx, uint64(len(lineBytes)))
+	res, err := s.lineBufferFn.Call(s.ctx, uint64(s.ptr), uint64(len(lineBytes)))
 	if err != nil {
 		return nil, err
 	}
 	linePtr := uint32(res[0])
-	defer freeFn.Call(s.ctx, uint64(linePtr))
-	s.mod.Memory().Write(linePtr, lineBytes)
+	if linePtr == 0 && len(lineBytes) > 0 {
+		return nil, errors.New("colorer_line_buffer returned a null pointer")
+	}
+	if len(lineBytes) > 0 {
+		s.mod.Memory().Write(linePtr, lineBytes)
+	}
 
-	ret, err := parseFn.Call(s.ctx, uint64(s.ptr), uint64(linePtr), uint64(len(lineBytes)))
+	ret, err := s.parseLineFn.Call(s.ctx, uint64(s.ptr), uint64(linePtr), uint64(len(lineBytes)))
 	if err != nil {
 		return nil, err
 	}
@@ -344,11 +363,10 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 		return nil, nil
 	}
 
-	regionsFn, err := s.exportedFn("colorer_get_regions")
-	if err != nil {
-		return nil, err
+	if s.getRegionsFn == nil {
+		return nil, errors.New("colorer_get_regions is not exported by the embedded colorer.wasm; rebuild it with ./build_wasm.sh")
 	}
-	ptrRes, err := regionsFn.Call(s.ctx, uint64(s.ptr))
+	ptrRes, err := s.getRegionsFn.Call(s.ctx, uint64(s.ptr))
 	if err != nil {
 		return nil, err
 	}
