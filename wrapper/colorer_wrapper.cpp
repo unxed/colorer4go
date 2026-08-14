@@ -263,6 +263,23 @@ int colorer_parse_line(void* handle, const char* line_utf8, int line_len) {
     return session->region_handler.regions.size();
 }
 
+// Every field of WasmRegion is 4 bytes on wasm32 (int, unsigned int, and a
+// pointer alike), so the struct is 32 bytes with no padding — this is what
+// lets colorer_get_regions hand the whole array back as one flat read
+// instead of eight host calls per region. If that ever stops holding, this
+// assertion fails the build instead of silently misreading memory.
+static_assert(sizeof(WasmRegion) == 32, "WasmRegion must pack to 32 bytes for the batched Go reader");
+
+// Returns a pointer to session->region_handler.regions.data(): count() *
+// sizeof(WasmRegion) bytes, valid until the next colorer_parse_line or
+// colorer_reset_session call on this handle. The caller already knows the
+// count from colorer_parse_line's return value.
+const void* colorer_get_regions(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return nullptr;
+    return session->region_handler.regions.data();
+}
+
 void colorer_forget_before(void* handle, int lno) {
     auto* session = static_cast<ColorerSession*>(handle);
     if (!session || lno <= 0) return;

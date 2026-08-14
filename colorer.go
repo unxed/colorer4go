@@ -3,6 +3,7 @@ package colorer
 import (
 	"context"
 	_ "embed"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -68,6 +69,14 @@ type Session struct {
 	r   wazero.Runtime
 	mod api.Module
 	ptr uint32 // Pointer to the ColorerSession struct in C++
+
+	// nameCache maps a region name's wasm pointer to the Go string already
+	// read from it. The wrapper's own name_cache (colorer_wrapper.cpp) keeps
+	// that pointer stable for the life of the session — schemas load once,
+	// and colorer_reset_session does not touch it — so a name is read out of
+	// linear memory at most once per session no matter how many lines carry
+	// it.
+	nameCache map[uint32]string
 }
 
 // NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM
@@ -303,6 +312,11 @@ func (s *Session) SelectType(fileName, firstLine string) (bool, error) {
 	return ret[0] != 0, nil
 }
 
+// wasmRegionSize is sizeof(WasmRegion) in colorer_wrapper.cpp: eight 4-byte
+// fields (int, unsigned int, and a pointer all being 4 bytes on wasm32), with
+// no padding — a static_assert on the C++ side guards this.
+const wasmRegionSize = 32
+
 func (s *Session) ParseLine(line string) ([]Region, error) {
 	allocFn := s.mod.ExportedFunction("colorer_alloc")
 	freeFn := s.mod.ExportedFunction("colorer_free")
@@ -326,41 +340,48 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 	if count < 0 {
 		return nil, errors.New("colorer_parse_line failed internally")
 	}
+	if count == 0 {
+		return nil, nil
+	}
+
+	regionsFn, err := s.exportedFn("colorer_get_regions")
+	if err != nil {
+		return nil, err
+	}
+	ptrRes, err := regionsFn.Call(s.ctx, uint64(s.ptr))
+	if err != nil {
+		return nil, err
+	}
+	buf, ok := s.mod.Memory().Read(uint32(ptrRes[0]), uint32(count*wasmRegionSize))
+	if !ok {
+		return nil, errors.New("failed to read region array from wasm memory")
+	}
+
+	if s.nameCache == nil {
+		s.nameCache = make(map[uint32]string)
+	}
 
 	regions := make([]Region, count)
-	getStart := s.mod.ExportedFunction("colorer_get_region_start")
-	getEnd := s.mod.ExportedFunction("colorer_get_region_end")
-	getName := s.mod.ExportedFunction("colorer_get_region_name")
-	getFore := s.mod.ExportedFunction("colorer_get_region_fore")
-	getBack := s.mod.ExportedFunction("colorer_get_region_back")
-	getStyle := s.mod.ExportedFunction("colorer_get_region_style")
-	getIsForeSet := s.mod.ExportedFunction("colorer_get_region_is_fore_set")
-	getIsBackSet := s.mod.ExportedFunction("colorer_get_region_is_back_set")
-
 	for i := 0; i < count; i++ {
-		rStart, _ := getStart.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rEnd, _ := getEnd.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rNamePtr, _ := getName.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rFore, _ := getFore.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rBack, _ := getBack.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rStyle, _ := getStyle.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rIsForeSet, _ := getIsForeSet.Call(s.ctx, uint64(s.ptr), uint64(i))
-		rIsBackSet, _ := getIsBackSet.Call(s.ctx, uint64(s.ptr), uint64(i))
-
-		nameStr, err := readString(s.mod.Memory(), uint32(rNamePtr[0]))
-		if err != nil {
-			return nil, err
+		rec := buf[i*wasmRegionSize:]
+		namePtr := binary.LittleEndian.Uint32(rec[8:12])
+		name, cached := s.nameCache[namePtr]
+		if !cached {
+			name, err = readString(s.mod.Memory(), namePtr)
+			if err != nil {
+				return nil, err
+			}
+			s.nameCache[namePtr] = name
 		}
-
 		regions[i] = Region{
-			Start:     int(rStart[0]),
-			End:       int(int32(rEnd[0])),
-			Name:      nameStr,
-			Fore:      uint32(rFore[0]),
-			Back:      uint32(rBack[0]),
-			Style:     uint32(rStyle[0]),
-			IsForeSet: rIsForeSet[0] != 0,
-			IsBackSet: rIsBackSet[0] != 0,
+			Start:     int(int32(binary.LittleEndian.Uint32(rec[0:4]))),
+			End:       int(int32(binary.LittleEndian.Uint32(rec[4:8]))),
+			Name:      name,
+			Fore:      binary.LittleEndian.Uint32(rec[12:16]),
+			Back:      binary.LittleEndian.Uint32(rec[16:20]),
+			Style:     binary.LittleEndian.Uint32(rec[20:24]),
+			IsForeSet: binary.LittleEndian.Uint32(rec[24:28]) != 0,
+			IsBackSet: binary.LittleEndian.Uint32(rec[28:32]) != 0,
 		}
 	}
 

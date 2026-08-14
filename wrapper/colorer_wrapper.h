@@ -19,6 +19,7 @@ __attribute__((used)) const char* colorer_get_hrd_description(void* handle, int 
 __attribute__((used)) int colorer_get_region_define(void* handle, const char* name, unsigned int* fore, unsigned int* back, unsigned int* style, int* isForeSet, int* isBackSet);
 __attribute__((used)) int colorer_select_type(void* handle, const char* file_name, const char* first_line);
 __attribute__((used)) int colorer_parse_line(void* handle, const char* line_utf8, int line_len);
+__attribute__((used)) const void* colorer_get_regions(void* handle);
 __attribute__((used)) void colorer_forget_before(void* handle, int lno);
 __attribute__((used)) int colorer_first_line(void* handle);
 __attribute__((used)) int colorer_next_line(void* handle);
