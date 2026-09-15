@@ -12,12 +12,14 @@ set(SOURCES
     src/pcolorer2/ChooseTypeMenu.h
     src/pcolorer2/FarEditor.h
     src/pcolorer2/FarEditorSet.h
+    src/pcolorer2/FarViewer.h
     src/pcolorer2/FarHrcSettings.h
     src/pcolorer2/pcolorer.h
     src/pcolorer2/tools.h
     src/pcolorer2/ChooseTypeMenu.cpp
     src/pcolorer2/FarEditor.cpp
     src/pcolorer2/FarEditorSet.cpp
+    src/pcolorer2/FarViewer.cpp
     src/pcolorer2/FarHrcSettings.cpp
     src/pcolorer2/pcolorer.cpp
     src/pcolorer2/tools.cpp
@@ -55,8 +57,8 @@ target_compile_definitions(colorer PUBLIC
 target_include_directories(colorer PRIVATE ${LIBCOLORER_TREE}/src)
 target_include_directories(colorer PRIVATE src/pcolorer2)
 target_include_directories(colorer PRIVATE src)
-target_include_directories(colorer PRIVATE ../WinPort)
-target_include_directories(colorer PRIVATE ../far2l/far2sdk)
+target_include_directories(colorer PRIVATE ${CMAKE_SOURCE_DIR}/WinPort)
+target_include_directories(colorer PRIVATE ${CMAKE_SOURCE_DIR}/far2l/far2sdk)
 
 set_target_properties(colorer
     PROPERTIES

@@ -2,9 +2,10 @@
 #define COLORER_TEXTPARSERPELPERS_H
 
 #include "colorer/parsers/HrcLibraryImpl.h"
+#include <vector>
 
-#if !defined COLORERMODE || defined NAMED_MATCHES_IN_HASH
-#error need (COLORERMODE & !NAMED_MATCHES_IN_HASH) in cregexp
+#if !defined COLORERMODE
+#error need COLORERMODE in cregexp
 #endif
 
 #define MATCH_NOTHING 0
@@ -19,17 +20,9 @@
 */
 class VTList
 {
-  VirtualEntryVector* vlist = nullptr;
-  VTList* prev = nullptr;
-  VTList* next = nullptr;
-  VTList* last = this;
-  VTList* shadowlast = nullptr;
-  int nodesnum = 0;
-
  public:
   VTList() = default;
-  ~VTList();
-  void deltree();
+  ~VTList() = default;
   bool push(SchemeNodeInherit* node);
   bool pop();
   SchemeImpl* pushvirt(SchemeImpl* scheme);
@@ -37,6 +30,16 @@ class VTList
   void clear();
   VirtualEntryVector** store();
   bool restore(VirtualEntryVector** store);
+
+ private:
+  struct Node
+  {
+    VirtualEntryVector* vlist = nullptr;
+    int shadow_last = -1;
+  };
+
+  std::vector<Node> nodes;
+  int last_index = -1;
 };
 
 /**
@@ -85,11 +88,22 @@ class ParseCache
   ~ParseCache();
   /**
    * Searched a cache position for the specified line number.
+   * Siblings are ordered by sline and do not overlap; the rightmost
+   * node with sline <= ln is the unique covering candidate (or a
+   * predecessor when that node ends before ln).
    * @param ln     Line number to search for
    * @param cache  Cache entry, filled with last child cache entry.
    * @return       Cache entry, assigned to the specified line number
    */
   ParseCache* searchLine(int ln, ParseCache** cache);
+  /** Delete the children list and clear the search cursor into it. */
+  void dropChildren();
+  /** Delete the sibling suffix starting at next. */
+  void dropNext();
+
+ private:
+  /** Last searched immediate child. idleJob's forward chunks resume here. */
+  ParseCache* search_child = nullptr;
 };
 
 #endif // COLORER_TEXTPARSERPELPERS_H

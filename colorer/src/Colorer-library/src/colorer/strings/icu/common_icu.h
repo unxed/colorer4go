@@ -6,11 +6,11 @@
 
 using UnicodeString = icu::UnicodeString;
 using uUnicodeString = std::unique_ptr<UnicodeString>;
-using CharacterClass = icu::UnicodeSet;
 
 constexpr UChar BAD_WCHAR = 0xFFFF;
 
 // system dependent byte
 using byte = unsigned char;
+using wchar = UChar;
 
 #endif  // COLORER_COMMON_ICU_H

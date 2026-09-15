@@ -1,11 +1,8 @@
 #include "colorer/cregexp/cregexp.h"
-#include <array>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <algorithm>
+#include <climits>
 
-StackElem* CRegExp::RegExpStack {nullptr};
-int CRegExp::RegExpStack_Size {0};
+std::vector<StackElem> CRegExp::RegExpStack;
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -20,7 +17,6 @@ void SMatches::topseSanitize(int cur)
     }
 }
 
-#if !defined NAMED_MATCHES_IN_HASH
 void SMatches::topnseSanitize(int cur)
 {
     while (topnse < cur) {
@@ -29,7 +25,6 @@ void SMatches::topnseSanitize(int cur)
       ne[topnse] = -1;
     }
 }
-#endif
 
 
 SRegInfo::SRegInfo()
@@ -39,26 +34,29 @@ SRegInfo::SRegInfo()
 SRegInfo::~SRegInfo()
 {
   delete next;
-  if (un.param)
-    switch (op) {
-      case EOps::ReEnum:
-      case EOps::ReNEnum:
-        delete un.charclass;
-        break;
-      case EOps::ReWord:
-        delete un.word;
-        break;
-#ifdef NAMED_MATCHES_IN_HASH
-      case EOps::ReNamedBrackets:
-      case EOps::ReBkBrackName:
-        if (namedata)
-          delete namedata;
-#endif
-      default:
-        if (op > EOps::ReBlockOps && (op < EOps::ReSymbolOps || op == EOps::ReBrackets || op == EOps::ReNamedBrackets))
-          delete un.param;
-        break;
-    }
+  switch (op) {
+    case EOps::ReEnum:
+      delete un.charclass;
+      break;
+    case EOps::ReWord:
+      delete un.word;
+      break;
+    case EOps::ReBrackets:
+    case EOps::ReNamedBrackets:
+    case EOps::ReOr:
+    case EOps::ReAhead:
+    case EOps::ReNAhead:
+    case EOps::ReBehind:
+    case EOps::ReNBehind:
+    case EOps::ReRangeN:
+    case EOps::ReRangeNM:
+    case EOps::ReNGRangeN:
+    case EOps::ReNGRangeNM:
+      delete un.param;
+      break;
+    default:
+      break;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -71,19 +69,24 @@ void CRegExp::init()
   firstNode = nullptr;
   firstCharMask = {};
   firstCharMaskUseful = false;
+  startAnchor = StartAnchor::None;
+  endAnchor = false;
+  maxLen = -1;
+  requiredChars = {};
+  requiredCharsCount = 0;
   cMatch = 0;
   global_pattern = nullptr;
+  parseBuf = nullptr;
 #ifdef COLORERMODE
   backRE = nullptr;
   backStr = nullptr;
   backTrace = nullptr;
+  usesBackTrace = false;
 #endif
-#ifndef NAMED_MATCHES_IN_HASH
   cnMatch = 0;
-#else
-  namedMatches = 0;
-#endif
   count_elem = 0;
+  parseSteps = 0;
+  stepBudgetExceeded = false;
 }
 CRegExp::CRegExp()
 {
@@ -98,13 +101,12 @@ CRegExp::CRegExp(const UnicodeString* text)
 CRegExp::~CRegExp()
 {
   delete tree_root;
-#ifndef NAMED_MATCHES_IN_HASH
   for (int bp = 0; bp < cnMatch; bp++) delete brnames[bp];
-#endif
 }
 
 bool CRegExp::matchChars(wchar one, wchar another) const
 {
+  // сознательное упрощение. правильнее дополнительно сравнивать toUpperCase, т.к. для Turkish I/ı и части Unicode это разное поведение
   return one == another ||
     (ignoreCase && Character::toLowerCase(one) == Character::toLowerCase(another));
 }
@@ -117,21 +119,27 @@ EError CRegExp::setRELow(const UnicodeString& expr)
 
   delete tree_root;
   tree_root = nullptr;
-#ifndef NAMED_MATCHES_IN_HASH
+  firstNode = nullptr;
+  firstCharMask = {};
+  firstCharMaskUseful = false;
+  startAnchor = StartAnchor::None;
+  endAnchor = false;
+  maxLen = -1;
+  requiredChars = {};
+  requiredCharsCount = 0;
   for (int bp = 0; bp < cnMatch; bp++) delete brnames[bp];
-#endif
 
   cMatch = 0;
-#ifndef NAMED_MATCHES_IN_HASH
   cnMatch = 0;
-#endif
   endChange = startChange = false;
+#ifdef COLORERMODE
+  usesBackTrace = false;
+#endif
   int start = 0;
-  while (Character::isWhitespace(expr[start])) start++;
-  if (expr[start] == '/')
-    start++;
-  else
+  while (start < len && Character::isWhitespace(expr[start])) start++;
+  if (start >= len || expr[start] != '/')
     return EError::ESYNTAX;
+  start++;
 
   bool ok = false;
   ignoreCase = extend = singleLine = multiLine = false;
@@ -161,16 +169,18 @@ EError CRegExp::setRELow(const UnicodeString& expr)
   tree_root->param0 = cMatch++;
 
   int endPos;
-  EError err = setStructs(tree_root->un.param, UnicodeString(expr, start, len), endPos);
-  if (endPos != len)
-    err = EError::EBRACKETS;
-
+  UnicodeString body(expr, start, len);
+  EError err = setStructs(tree_root->un.param, body, 0, len, endPos);
   if (err != EError::EOK)
     return err;
+  if (endPos != len)
+    return EError::EBRACKETS;
   optimize();
   return EError::EOK;
 }
 
+// Fill skip facts for parseRE / mayMatch: first-char mask, start/end
+// anchors, maxLen, required ASCII sets, per-| branchFirst. See class docs.
 void CRegExp::optimize()
 {
   SRegInfo* next = tree_root;
@@ -205,8 +215,7 @@ void CRegExp::optimize()
       }
       break;
     }
-    if (next->op == EOps::ReSymb || next->op == EOps::ReWord ||
-        next->op == EOps::ReEnum || next->op == EOps::ReNEnum) {
+    if (next->op == EOps::ReSymb || next->op == EOps::ReWord || next->op == EOps::ReEnum) {
       firstNode = next;
     }
     break;
@@ -216,6 +225,314 @@ void CRegExp::optimize()
   firstCharMask = firstChars.mask;
   firstCharMaskUseful = !firstChars.nullable &&
     (firstCharMask[0] != ~uint64_t(0) || firstCharMask[1] != ~uint64_t(0));
+
+  analyzeStartAnchor();
+  analyzeEndAnchor();
+  analyzeMaxLen();
+  analyzeRequiredChars();
+  analyzeBranchFirstChars(tree_root);
+}
+
+void CRegExp::analyzeStartAnchor()
+{
+  startAnchor = StartAnchor::None;
+  // Descend through leading brackets only; an alternation or quantifier at the
+  // front means other branches may start elsewhere.
+  const SRegInfo* node = tree_root;
+  while (node && (node->op == EOps::ReBrackets || node->op == EOps::ReNamedBrackets)) {
+    node = node->un.param;
+  }
+  if (!node || node->op != EOps::ReMetaSymb) {
+    return;
+  }
+  if (node->un.metaSymbol == EMetaSymbols::ReSoL && !multiLine) {
+    startAnchor = StartAnchor::LineStart;
+  }
+#ifdef COLORERMODE
+  else if (node->un.metaSymbol == EMetaSymbols::ReSoScheme) {
+    startAnchor = StartAnchor::SchemeStart;
+  }
+#endif
+}
+
+void CRegExp::analyzeEndAnchor()
+{
+  endAnchor = false;
+  if (multiLine) {
+    return;
+  }
+  // Last node of the top chain, descending through trailing brackets. A
+  // top-level alternation means some branch may finish before eol.
+  const SRegInfo* node = tree_root;
+  while (node) {
+    if (node->op == EOps::ReOr) {
+      return;
+    }
+    if (node->next) {
+      node = node->next;
+      continue;
+    }
+    if (node->op == EOps::ReBrackets || node->op == EOps::ReNamedBrackets) {
+      node = node->un.param;
+      continue;
+    }
+    break;
+  }
+  if (node && node->op == EOps::ReMetaSymb && node->un.metaSymbol == EMetaSymbols::ReEoL) {
+    endAnchor = true;
+  }
+}
+
+static int addBounded(int a, int b)
+{
+  if (a < 0 || b < 0) {
+    return -1;
+  }
+  if (a > INT_MAX - b) {
+    return -1;
+  }
+  return a + b;
+}
+
+int CRegExp::maxLenOfNode(const SRegInfo* re) const
+{
+  if (!re) {
+    return 0;
+  }
+  switch (re->op) {
+    case EOps::ReSymb:
+    case EOps::ReEnum:
+      return 1;
+    case EOps::ReWord:
+      return re->un.word != nullptr ? re->un.word->length() : 0;
+    case EOps::ReMetaSymb:
+      switch (re->un.metaSymbol) {
+        case EMetaSymbols::ReAnyChr:
+        case EMetaSymbols::ReDigit:
+        case EMetaSymbols::ReNDigit:
+        case EMetaSymbols::ReWordSymb:
+        case EMetaSymbols::ReNWordSymb:
+        case EMetaSymbols::ReWSpace:
+        case EMetaSymbols::ReNWSpace:
+        case EMetaSymbols::ReUCase:
+        case EMetaSymbols::ReNUCase:
+          return 1;
+        case EMetaSymbols::ReSoL:
+        case EMetaSymbols::ReEoL:
+        case EMetaSymbols::ReWBound:
+        case EMetaSymbols::ReNWBound:
+        case EMetaSymbols::RePreNW:
+#ifdef COLORERMODE
+        case EMetaSymbols::ReSoScheme:
+        case EMetaSymbols::ReStart:
+        case EMetaSymbols::ReEnd:
+#endif
+          return 0;
+        default:
+          return -1;
+      }
+    case EOps::ReBrackets:
+    case EOps::ReNamedBrackets:
+      return maxLenOfChain(re->un.param);
+    case EOps::ReRangeN:
+    case EOps::ReNGRangeN:
+      return -1;
+    case EOps::ReRangeNM:
+    case EOps::ReNGRangeNM: {
+      if (re->e < 0) {
+        return -1;
+      }
+      const int inner = maxLenOfChain(re->un.param);
+      if (inner < 0) {
+        return -1;
+      }
+      if (re->e != 0 && inner > INT_MAX / re->e) {
+        return -1;
+      }
+      return re->e * inner;
+    }
+    case EOps::ReAhead:
+    case EOps::ReNAhead:
+    case EOps::ReBehind:
+    case EOps::ReNBehind:
+    case EOps::ReEmpty:
+      return 0;
+#ifdef COLORERMODE
+    case EOps::ReBkTrace:
+    case EOps::ReBkTraceN:
+    case EOps::ReBkTraceName:
+    case EOps::ReBkTraceNName:
+#endif
+    case EOps::ReBkBrack:
+    case EOps::ReBkBrackName:
+    case EOps::ReOr:
+    default:
+      return -1;
+  }
+}
+
+int CRegExp::maxLenOfChain(const SRegInfo* re) const
+{
+  int total = 0;
+  for (const auto* node = re; node; node = node->next) {
+    if (node->op == EOps::ReOr) {
+      const int left = maxLenOfChain(node->un.param);
+      const int right = maxLenOfChain(node->next);
+      if (left < 0 || right < 0) {
+        return -1;
+      }
+      return addBounded(total, left > right ? left : right);
+    }
+    const int n = maxLenOfNode(node);
+    if (n < 0) {
+      return -1;
+    }
+    total = addBounded(total, n);
+    if (total < 0) {
+      return -1;
+    }
+  }
+  return total;
+}
+
+void CRegExp::analyzeMaxLen()
+{
+  maxLen = maxLenOfChain(tree_root);
+}
+
+static int popcountMask(const AsciiCharMask& mask)
+{
+  int count = 0;
+  for (auto word : mask) {
+    while (word) {
+      word &= word - 1;
+      count++;
+    }
+  }
+  return count;
+}
+
+void CRegExp::analyzeRequiredChars()
+{
+  requiredChars = {};
+  requiredCharsCount = 0;
+  auto sets = requiredCharsForChain(tree_root);
+  // Keep the most selective sets (fewest characters).
+  std::sort(sets.begin(), sets.end(), [](const AsciiCharMask& a, const AsciiCharMask& b) {
+    return popcountMask(a) < popcountMask(b);
+  });
+  for (const auto& set : sets) {
+    if (requiredCharsCount == MAX_REQUIRED_SETS) {
+      break;
+    }
+    bool duplicate = false;
+    for (int i = 0; i < requiredCharsCount; i++) {
+      if (requiredChars[i] == set) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      requiredChars[requiredCharsCount++] = set;
+    }
+  }
+}
+
+void CRegExp::addRequiredChar(std::vector<AsciiCharMask>& out, wchar ch) const
+{
+  const auto value = static_cast<uint32_t>(ch);
+  if (value >= 128) {
+    return;
+  }
+  // Under /i a letter may also match a non-ASCII case variant (e.g. KELVIN SIGN for k),
+  // which the ASCII line mask cannot see.
+  if (ignoreCase && ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z'))) {
+    return;
+  }
+  AsciiCharMask set = {};
+  set[value >> 6] |= uint64_t(1) << (value & 63);
+  out.push_back(set);
+}
+
+std::vector<AsciiCharMask> CRegExp::requiredCharsForNode(const SRegInfo* re) const
+{
+  std::vector<AsciiCharMask> result;
+  if (!re) {
+    return result;
+  }
+  switch (re->op) {
+    case EOps::ReSymb:
+      addRequiredChar(result, re->un.symbol);
+      break;
+    case EOps::ReWord:
+      for (int i = 0; i < re->un.word->length(); i++) {
+        addRequiredChar(result, (*re->un.word)[i]);
+      }
+      break;
+    case EOps::ReBrackets:
+    case EOps::ReNamedBrackets:
+    case EOps::ReAhead:
+    case EOps::ReBehind:
+      result = requiredCharsForChain(re->un.param);
+      break;
+    case EOps::ReRangeN:
+    case EOps::ReRangeNM:
+    case EOps::ReNGRangeN:
+    case EOps::ReNGRangeNM:
+      if (re->s > 0) {
+        result = requiredCharsForChain(re->un.param);
+      }
+      break;
+    default:
+      // Character classes and meta symbols may match non-ASCII text; back
+      // references and negative look-arounds add nothing certain.
+      break;
+  }
+  return result;
+}
+
+std::vector<AsciiCharMask> CRegExp::requiredCharsForChain(const SRegInfo* re) const
+{
+  std::vector<AsciiCharMask> result;
+  for (const auto* node = re; node; node = node->next) {
+    if (node->op == EOps::ReOr) {
+      // Either branch may match: any (left ∪ right) pair is still required.
+      const auto left = requiredCharsForChain(node->un.param);
+      const auto right = requiredCharsForChain(node->next);
+      for (const auto& l : left) {
+        for (const auto& r : right) {
+          result.push_back({l[0] | r[0], l[1] | r[1]});
+        }
+      }
+      // Nested alternations multiply the pairs; keep the few most selective ones.
+      if (result.size() > static_cast<size_t>(MAX_REQUIRED_SETS)) {
+        std::sort(result.begin(), result.end(), [](const AsciiCharMask& a, const AsciiCharMask& b) {
+          return popcountMask(a) < popcountMask(b);
+        });
+        result.resize(MAX_REQUIRED_SETS);
+      }
+      break;
+    }
+    auto current = requiredCharsForNode(node);
+    result.insert(result.end(), current.begin(), current.end());
+  }
+  return result;
+}
+
+void CRegExp::collectAsciiChars(const UnicodeString& str, AsciiCharMask& mask)
+{
+  mask = {};
+  const wchar* buf = str.getBuffer();
+  if (buf == nullptr) {
+    return;
+  }
+  const int len = str.length();
+  for (int i = 0; i < len; i++) {
+    const auto value = static_cast<uint32_t>(buf[i]);
+    if (value < 128) {
+      mask[value >> 6] |= uint64_t(1) << (value & 63);
+    }
+  }
 }
 
 void CRegExp::addFirstChar(FirstChars& result, wchar ch) const
@@ -249,9 +566,8 @@ CRegExp::FirstChars CRegExp::firstCharsForNode(const SRegInfo* re) const
       else result.nullable = true;
       break;
     case EOps::ReEnum:
-    case EOps::ReNEnum:
       for (uint32_t ch = 0; ch < 128; ch++) {
-        if (re->un.charclass->contains(static_cast<wchar>(ch)) == (re->op == EOps::ReEnum)) {
+        if (re->un.charclass->contains(static_cast<wchar>(ch))) {
           result.mask[ch >> 6] |= uint64_t(1) << (ch & 63);
         }
       }
@@ -341,27 +657,65 @@ CRegExp::FirstChars CRegExp::analyzeFirstChars(const SRegInfo* re) const
   return result;
 }
 
-EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos)
+void CRegExp::analyzeBranchFirstChars(SRegInfo* re)
+{
+  for (SRegInfo* node = re; node; node = node->next) {
+    switch (node->op) {
+      case EOps::ReOr: {
+        const auto first = analyzeFirstChars(node->un.param);
+        // Descend through grouping so (\M\s+) is treated like \M\s+. A
+        // zero-width head (\m \M \b lookaround ^ $ empty) must not be skipped:
+        // \M in a failed alternative still bounds group 0 for a later one.
+        const SRegInfo* atom = node->un.param;
+        while (atom && (atom->op == EOps::ReBrackets || atom->op == EOps::ReNamedBrackets)) {
+          atom = atom->un.param;
+        }
+        const bool leadingNullable = !atom || firstCharsForNode(atom).nullable;
+        node->branchFirst = first.mask;
+        node->branchFirstUseful = !leadingNullable && !first.nullable &&
+          (first.mask[0] != ~uint64_t(0) || first.mask[1] != ~uint64_t(0));
+        analyzeBranchFirstChars(node->un.param);
+        break;
+      }
+      case EOps::ReBrackets:
+      case EOps::ReNamedBrackets:
+      case EOps::ReAhead:
+      case EOps::ReNAhead:
+      case EOps::ReBehind:
+      case EOps::ReNBehind:
+      case EOps::ReRangeN:
+      case EOps::ReRangeNM:
+      case EOps::ReNGRangeN:
+      case EOps::ReNGRangeNM:
+        analyzeBranchFirstChars(node->un.param);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int from, int to, int& retPos)
 {
   SRegInfo *next, *temp;
 
   retPos = 0;
-  if (!expr.length())
+  if (from >= to)
     return EError::EOK;
   retPos = -1;
 
   next = re;
-  for (int i = 0; i < expr.length(); i++) {
+  for (int i = from; i < to; i++) {
     // simple character
     if (extend && Character::isWhitespace(expr[i]))
       continue;
     // context return
     if (expr[i] == ')') {
-      retPos = i;
+      retPos = i - from;
       break;
     }
     // next element
-    if (i != 0) {
+    if (i != from) {
       next->next = new SRegInfo;
       next->next->parent = next->parent;
       next->next->prev = next;
@@ -369,6 +723,8 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
     }
     // Escape symbol
     if (expr[i] == '\\') {
+      if (i + 1 >= to)
+        return EError::ESYNTAX;
       int blen;
       switch (expr[i + 1]) {
         case 'd':
@@ -436,10 +792,12 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
           next->op = EOps::ReMetaSymb;
           next->un.metaSymbol = EMetaSymbols::ReEnd;
           break;
-#ifndef NAMED_MATCHES_IN_HASH
         case 'y':
         case 'Y':
+          usesBackTrace = true;
           next->op = (expr[i + 1] == 'y' ? EOps::ReBkTrace : EOps::ReBkTraceN);
+          if (i + 2 >= to)
+            return EError::ESYNTAX;
           next->param0 = UnicodeTools::getHex(expr[i + 2]);
           if (next->param0 != -1) {
             i++;
@@ -460,26 +818,19 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
           }
           break;
 #endif  // COLORERMODE
-#endif  // NAMED_MATCHES_IN_HASH
 
         case 'p':  // \p{name}
         {
+          if (i + 2 >= to)
+            return EError::ESYNTAX;
           next->op = EOps::ReBkBrackName;
           auto br_name = UnicodeTools::getCurlyContent(expr, i + 2);
           if (br_name == nullptr)
             return EError::ESYNTAX;
           blen = br_name->length();
-#ifndef NAMED_MATCHES_IN_HASH
           next->param0 = getBracketNo(br_name.get());
           if (next->param0 == -1)
             return EError::ESYNTAX;
-#else
-          if (br_name->length() && namedMatches && !namedMatches->getItem(br_name)) {
-            return EBRACKETS;
-          }
-          next->param0 = 0;
-          next->namedata = new UnicodeString(br_name);
-#endif
           i += blen + 2;
         } break;
         default:
@@ -525,7 +876,7 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
     next->un.param = nullptr;
     next->param0 = 0;
 
-    if (expr.length() > i + 2) {
+    if (to > i + 2) {
       if (expr[i] == '?' && expr[i + 1] == '#' && expr[i + 2] >= '0' && expr[i + 2] <= '9') {
         next->op = EOps::ReBehind;
         next->param0 = UnicodeTools::getHex(expr[i + 2]);
@@ -539,7 +890,7 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
         continue;
       }
     }
-    if (expr.length() > i + 1) {
+    if (to > i + 1) {
       if (expr[i] == '*' && expr[i + 1] == '?') {
         next->op = EOps::ReNGRangeN;
         next->s = 0;
@@ -599,8 +950,8 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
       int comma = -1;
       bool nonGreedy = false;
       int j;
-      for (j = i; j < expr.length(); j++) {
-        if (expr.length() > j + 1 && expr[j] == '}' && expr[j + 1] == '?') {
+      for (j = i; j < to; j++) {
+        if (to > j + 1 && expr[j] == '}' && expr[j + 1] == '?') {
           en = j;
           nonGreedy = true;
           j++;
@@ -622,11 +973,12 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
         next->e = UnicodeTools::getNumber(&expr, comma + 1, en - comma - 1);
       else
         next->e = next->s;
-      if (next->e == -1)
+      if (next->s < 0)
         return EError::EOP;
-
       if (en - comma == 1)
         next->e = -1;
+      else if (next->e < next->s)
+        return EError::EOP;
       if (next->e == -1)
         next->op = nonGreedy ? EOps::ReNGRangeN : EOps::ReRangeN;
       else
@@ -636,18 +988,15 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
     }
     // ( ... )
     if (expr[i] == '(') {
-      // bool namedBracket = false;
       // perl-like "uncaptured" brackets
-      if (expr.length() >= i + 2 && expr[i + 1] == '?' && expr[i + 2] == ':') {
+      if (to >= i + 2 && expr[i + 1] == '?' && expr[i + 2] == ':') {
         next->op = EOps::ReNamedBrackets;
         next->param0 = -1;
-        // namedBracket = true;
         i += 3;
       }
-      else if (expr.length() > i + 2 && expr[i + 1] == '?' && expr[i + 2] == '{') {
+      else if (to > i + 2 && expr[i + 1] == '?' && expr[i + 2] == '{') {
         // named bracket
         next->op = EOps::ReNamedBrackets;
-        // namedBracket = true;
         auto s_curly = UnicodeTools::getCurlyContent(expr, i + 2);
         if (s_curly == nullptr)
           return EError::EBRACKETS;
@@ -658,34 +1007,16 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
           delete br_name;
         }
         else {
-#ifndef NAMED_MATCHES_IN_HASH
-#ifdef CHECKNAMES
-          if (getBracketNo(br_name) != -1) {
-            delete br_name;
-            return EError::EBRACKETS;
-          }
-#endif
           if (cnMatch < NAMED_MATCHES_NUM) {
             next->param0 = cnMatch;
             brnames[cnMatch] = br_name;
             cnMatch++;
           }
-          else
+          else {
+            // HRC schemes may exceed the slot count; extra groups stay non-capturing
             delete br_name;
-#else
-#ifdef CHECKNAMES
-          if (br_name->length() && namedMatches && namedMatches->getItem(br_name)) {
-            delete br_name;
-            return EError::EBRACKETS;
+            next->param0 = -1;
           }
-#endif
-          next->param0 = 0;
-          next->namedata = br_name;
-          if (namedMatches) {
-            SMatch mt = {-1, -1};
-            namedMatches->setItem(br_name, mt);
-          }
-#endif
         }
         i += blen + 4;
       }
@@ -695,13 +1026,15 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
           next->param0 = cMatch;
           cMatch++;
         }
+        else
+          next->param0 = -1;
         i += 1;
       }
       next->un.param = new SRegInfo;
       next->un.param->parent = next;
       int endPos;
-      EError err = setStructs(next->un.param, UnicodeString(expr, i), endPos);
-      if (expr.length() - i - endPos == 0)
+      EError err = setStructs(next->un.param, expr, i, to, endPos);
+      if (to - i - endPos == 0)
         return EError::EBRACKETS;
       if (err != EError::EOK)
         return err;
@@ -715,7 +1048,6 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
       auto cc = UStr::createCharClass(expr, i, &endPos, ignoreCase);
       if (cc == nullptr)
         return EError::EENUM;
-      //      next->op = (exprn[i] == ReEnumS) ? ReEnum : ReNEnum;
       next->op = EOps::ReEnum;
       next->un.charclass = cc.release();
       i = endPos;
@@ -743,9 +1075,9 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
     if (wsize > 1) {
       reafterword = resymb;
       resymb = reword;
-      UChar* wcword = new UChar[wsize];
+      auto* word = new UnicodeString();
       for (int idx = 0; idx < wsize; idx++) {
-        wcword[idx] = resymb->un.symbol;
+        word->append(resymb->un.symbol);
         SRegInfo* retmp = resymb;
         resymb = resymb->next;
         retmp->next = nullptr;
@@ -753,8 +1085,7 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
           delete retmp;
       }
       reword->op = EOps::ReWord;
-      reword->un.word = new UnicodeString(wcword, wsize);
-      delete[] wcword;
+      reword->un.word = word;
       reword->next = reafterword;
       if (reafterword)
         reafterword->prev = reword;
@@ -830,7 +1161,7 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
     next = next->next;
   }
   if (retPos == -1)
-    retPos = expr.length();
+    retPos = to - from;
   return EError::EOK;
 }
 
@@ -838,166 +1169,34 @@ EError CRegExp::setStructs(SRegInfo*& re, const UnicodeString& expr, int& retPos
 // parsing
 ////////////////////////////////////////////////////////////////////////////
 
-static bool isLineBreak(wchar_t c)
+void CRegExp::growRegExpStack()
 {
-   return c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x85 || c == 0x2028 || c == 0x2029;
+  RegExpStack.resize(RegExpStack.empty() ? INIT_MEM_SIZE : RegExpStack.size() + MEM_INC);
 }
 
-bool CRegExp::isWordBoundary(int toParse)
+bool CRegExp::matchCopiedRange(const UnicodeString& src, int from, int to, int& toParse, bool icase) const
 {
-  const bool after = (toParse < end && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse]));
-  const bool before = (toParse > 0 && Character::isLetterOrDigitOrUnderscore((*global_pattern)[toParse - 1]));
-  return before != after;
-}
-
-bool CRegExp::checkMetaSymbol(EMetaSymbols symb, int& toParse)
-{
-  const UnicodeString& pattern = *global_pattern;
-
-  switch (symb) {
-    case EMetaSymbols::ReAnyChr:
-      if (toParse >= end || (!singleLine && isLineBreak(pattern[toParse])))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReSoL:
-        return toParse == 0 || (multiLine && isLineBreak(pattern[toParse - 1]));
-
-    case EMetaSymbols::ReEoL:
-      return toParse == end || (multiLine && toParse && toParse < end && isLineBreak(pattern[toParse - 1]));
-
-    case EMetaSymbols::ReDigit:
-      if (toParse >= end || !Character::isDigit(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReNDigit:
-      if (toParse >= end || Character::isDigit(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReWordSymb:
-      if (toParse >= end || !Character::isLetterOrDigitOrUnderscore(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReNWordSymb:
-      if (toParse >= end || Character::isLetterOrDigitOrUnderscore(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReWSpace:
-      if (toParse >= end || !Character::isWhitespace(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReNWSpace:
-      if (toParse >= end || Character::isWhitespace(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReUCase:
-      if (toParse >= end || !Character::isUpperCase(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReNUCase:
-      if (toParse >= end || !Character::isLowerCase(pattern[toParse]))
-        return false;
-      toParse++;
-      return true;
-
-    case EMetaSymbols::ReWBound:
-      return isWordBoundary(toParse);
-
-    case EMetaSymbols::ReNWBound:
-      return !isWordBoundary(toParse);
-
-    case EMetaSymbols::RePreNW:
-      return toParse == 0 || toParse >= end || !Character::isLetter(pattern[toParse - 1]);
-
-#ifdef COLORERMODE
-    case EMetaSymbols::ReSoScheme:
-      return (schemeStart == toParse);
-
-    case EMetaSymbols::ReStart:
-      matches->s[0] = toParse;
-      startChange = true;
-      return true;
-
-    case EMetaSymbols::ReEnd:
-      matches->e[0] = toParse;
-      endChange = true;
-      return true;
-#endif
-
-    default:
+  // Unmatched groups are stored as -1,-1; the classic copy loop then does nothing.
+  if (from < 0 || to < 0)
+    return true;
+  if (from >= to)
+    return true;
+  const wchar* srcBuf = src.getBuffer();
+  if (srcBuf == nullptr)
+    return false;
+  for (int i = from; i < to; i++) {
+    if (toParse >= end)
       return false;
+    if (icase) {
+      if (Character::toLowerCase(parseBuf[toParse]) != Character::toLowerCase(srcBuf[i]))
+        return false;
+    }
+    else if (parseBuf[toParse] != srcBuf[i]) {
+      return false;
+    }
+    toParse++;
   }
-}
-
-void CRegExp::check_stack(bool res, SRegInfo** re, SRegInfo** prev, int* toParse, bool* leftenter, int* action)
-{
-  if (count_elem == 0) {
-    *action = res;
-    return;
-  }
-
-  StackElem& ne = CRegExp::RegExpStack[--count_elem];
-  if (res) {
-    *action = ne.ifTrueReturn;
-  }
-  else {
-    *action = ne.ifFalseReturn;
-  }
-  *re = ne.re;
-  *prev = ne.prev;
-  *toParse = ne.toParse;
-  *leftenter = ne.leftenter;
-}
-
-void CRegExp::insert_stack(SRegInfo** re, SRegInfo** prev, int* toParse, bool* leftenter, int ifTrueReturn,
-                           int ifFalseReturn, SRegInfo** re2, SRegInfo** prev2, int toParse2)
-{
-  if (RegExpStack_Size == 0) {
-    CRegExp::RegExpStack = new StackElem[INIT_MEM_SIZE];
-    RegExpStack_Size = INIT_MEM_SIZE;
-  }
-  if (RegExpStack_Size == count_elem) {
-    RegExpStack_Size += MEM_INC;
-    StackElem* s = new StackElem[RegExpStack_Size];
-    memcpy(s, CRegExp::RegExpStack, count_elem * sizeof(StackElem));
-    delete[] CRegExp::RegExpStack;
-    CRegExp::RegExpStack = s;
-  }
-  StackElem& ne = CRegExp::RegExpStack[count_elem++];
-  ne.re = *re;
-  ne.prev = *prev;
-  ne.toParse = *toParse;
-  ne.ifTrueReturn = ifTrueReturn;
-  ne.ifFalseReturn = ifFalseReturn;
-  ne.leftenter = *leftenter;
-
-  if (prev2 == nullptr)
-    *prev = nullptr;
-  else
-    *prev = *prev2;
-  *re = *re2;
-  *toParse = toParse2;
-  // this is init operation from lowParse
-  *leftenter = true;
-  if (!*re) {
-    *re = (*prev)->parent;
-    *leftenter = false;
-  }
+  return true;
 }
 
 bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
@@ -1005,16 +1204,23 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
   int i, sv, wlen;
   bool leftenter = true;
   bool br = false;
-  const UnicodeString& pattern = *global_pattern;
-  int action = -1;
+  const wchar* const buf = parseBuf;
+  ReAction action = rea_None;
 
   if (!re) {
+    if (prev == nullptr) {
+      return false;
+    }
     re = prev->parent;
     leftenter = false;
   }
   while (true) {
-    while (re || action != -1) {
-      if (re && action == -1)
+    while (re || action != rea_None) {
+      if (++parseSteps > parseStepLimit) {
+        stepBudgetExceeded = true;
+        return false;
+      }
+      if (re && action == rea_None)
         switch (re->op) {
           case EOps::ReEmpty:
             break;
@@ -1037,80 +1243,68 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
                 matches->s[re->param0] = matches->e[re->param0];
             }
             else {
-#ifndef NAMED_MATCHES_IN_HASH
               matches->topnseSanitize(re->param0);
               matches->ns[re->param0] = re->s;
               matches->ne[re->param0] = toParse;
               if (matches->ne[re->param0] < matches->ns[re->param0])
                 matches->ns[re->param0] = matches->ne[re->param0];
-#else
-              SMatch mt = {re->s, toParse};
-              namedMatches->setItem(re->namedata, mt);
-#endif
             }
             break;
           case EOps::ReSymb:
             if (toParse >= end) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            if (!matchChars(pattern[toParse], re->un.symbol)) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!matchChars(buf[toParse], re->un.symbol)) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             toParse++;
             break;
           case EOps::ReMetaSymb:
             if (!checkMetaSymbol(re->un.metaSymbol, toParse)) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             break;
           case EOps::ReWord:
             wlen = re->un.word->length();
             if (toParse + wlen > end) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             if (ignoreCase) {
-              if (UStr::caseCompare(pattern, toParse, wlen, *re->un.word) != 0) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              if (UStr::caseCompare(*global_pattern, toParse, wlen, *re->un.word) != 0) {
+                check_stack(false, re, prev, toParse, leftenter, action);
                 continue;
               }
-              toParse += wlen;
             }
-            else {
-              br = false;
-              for (i = 0; i < wlen; i++) {
-                if (pattern[toParse + i] != (*re->un.word)[i]) {
-                  check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                  br = true;
+            else if (wlen != 0) {
+              const wchar* wordBuf = re->un.word->getBuffer();
+              if (wordBuf == nullptr) {
+                check_stack(false, re, prev, toParse, leftenter, action);
+                continue;
+              }
+              int k = 0;
+              for (; k < wlen; k++) {
+                if (buf[toParse + k] != wordBuf[k]) {
                   break;
                 }
               }
-              if (br)
+              if (k != wlen) {
+                check_stack(false, re, prev, toParse, leftenter, action);
                 continue;
-              toParse += wlen;
+              }
             }
+            toParse += wlen;
             break;
           case EOps::ReEnum:
             if (toParse >= end) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            if (!re->un.charclass->contains(pattern[toParse])) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-            toParse++;
-            break;
-          case EOps::ReNEnum:
-            if (toParse >= end) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-            if (re->un.charclass->contains(pattern[toParse])) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!re->un.charclass->contains(buf[toParse])) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             toParse++;
@@ -1118,110 +1312,73 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
 #ifdef COLORERMODE
           case EOps::ReBkTrace:
             sv = re->param0;
-            if (!backStr || !backTrace || sv == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!backStr || !backTrace || sv < 0 || sv >= MATCHES_NUM) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            br = false;
-            for (i = backTrace->s[sv]; i < backTrace->e[sv]; i++) {
-              if (toParse >= end || pattern[toParse] != (*backStr)[i]) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                br = true;
-                break;
-              }
-              toParse++;
-            }
-            if (br)
+            backTrace->topseSanitize(sv);
+            if (!matchCopiedRange(*backStr, backTrace->s[sv], backTrace->e[sv], toParse, false)) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
+            }
             break;
           case EOps::ReBkTraceN:
             sv = re->param0;
-            if (!backStr || !backTrace || sv == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!backStr || !backTrace || sv < 0 || sv >= MATCHES_NUM) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            br = false;
-            for (i = backTrace->s[sv]; i < backTrace->e[sv]; i++) {
-              if (toParse >= end || Character::toLowerCase(pattern[toParse]) != Character::toLowerCase((*backStr)[i])) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                br = true;
-                break;
-              }
-              toParse++;
-            }
-            if (br)
+            backTrace->topseSanitize(sv);
+            if (!matchCopiedRange(*backStr, backTrace->s[sv], backTrace->e[sv], toParse, true)) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
+            }
             break;
           case EOps::ReBkTraceName:
-#ifndef NAMED_MATCHES_IN_HASH
             sv = re->param0;
-            if (!backStr || !backTrace || sv == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!backStr || !backTrace || sv < 0 || sv >= NAMED_MATCHES_NUM) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            br = false;
-            for (i = backTrace->ns[sv]; i < backTrace->ne[sv]; i++) {
-              if (toParse >= end || pattern[toParse] != (*backStr)[i]) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                br = true;
-                break;
-              }
-              toParse++;
-            }
-            if (br)
+            backTrace->topnseSanitize(sv);
+            if (!matchCopiedRange(*backStr, backTrace->ns[sv], backTrace->ne[sv], toParse, false)) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
+            }
             break;
-#else
-            // !!!;
-            {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-#endif  // NAMED_MATCHES_IN_HASH
           case EOps::ReBkTraceNName:
-#ifndef NAMED_MATCHES_IN_HASH
             sv = re->param0;
-            if (!backStr || !backTrace || sv == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            if (!backStr || !backTrace || sv < 0 || sv >= NAMED_MATCHES_NUM || backTrace->cnMatch <= sv) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
-            br = false;
-            for (i = backTrace->s[sv]; i < backTrace->e[sv]; i++) {
-              if (toParse >= end || Character::toLowerCase(pattern[toParse]) != Character::toLowerCase((*backStr)[i])) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                br = true;
-                break;
-              }
-              toParse++;
-            }
-            if (br)
+            backTrace->topnseSanitize(sv);
+            if (backTrace->ns[sv] == -1 || backTrace->ne[sv] == -1) {
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
+            }
+            if (!matchCopiedRange(*backStr, backTrace->ns[sv], backTrace->ne[sv], toParse, true)) {
+              check_stack(false, re, prev, toParse, leftenter, action);
+              continue;
+            }
             break;
-#else
-            // !!;
-            {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-#endif  // NAMED_MATCHES_IN_HASH
 #endif  // COLORERMODE
 
           case EOps::ReBkBrackName:
-#ifndef NAMED_MATCHES_IN_HASH
             sv = re->param0;
             if (sv == -1 || cnMatch <= sv) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             matches->topnseSanitize(sv);
             if (matches->ns[sv] == -1 || matches->ne[sv] == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             br = false;
             for (i = matches->ns[sv]; i < matches->ne[sv]; i++) {
-              if (toParse >= end || pattern[toParse] != pattern[i]) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              if (toParse >= end || buf[toParse] != buf[i]) {
+                check_stack(false, re, prev, toParse, leftenter, action);
                 br = true;
                 break;
               }
@@ -1230,46 +1387,22 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             if (br)
               continue;
             break;
-#else
-          {
-            SMatch* mt = namedMatches->getItem(re->namedata);
-            if (!mt) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-            if (mt->s == -1 || mt->e == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-              continue;
-            }
-            br = false;
-            for (i = mt->s; i < mt->e; i++) {
-              if (toParse >= end || pattern[toParse] != pattern[i]) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
-                br = true;
-                break;
-              }
-              toParse++;
-            }
-            if (br)
-              continue;
-          } break;
-#endif  // NAMED_MATCHES_IN_HASH
 
           case EOps::ReBkBrack:
             sv = re->param0;
             if (sv == -1 || cMatch <= sv) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             matches->topseSanitize(sv);
             if (matches->s[sv] == -1 || matches->e[sv] == -1) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             br = false;
             for (i = matches->s[sv]; i < matches->e[sv]; i++) {
-              if (toParse >= end || pattern[toParse] != pattern[i]) {
-                check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              if (toParse >= end || buf[toParse] != buf[i]) {
+                check_stack(false, re, prev, toParse, leftenter, action);
                 br = true;
                 break;
               }
@@ -1280,46 +1413,46 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             break;
           case EOps::ReAhead:
             if (!leftenter) {
-              check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(true, re, prev, toParse, leftenter, action);
               continue;
             }
             {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_Break, rea_False, &re->un.param, nullptr, toParse);
+              insert_stack(re, prev, toParse, leftenter, rea_Break, rea_False, re->un.param, nullptr, toParse);
               continue;
             }
             break;
           case EOps::ReNAhead:
             if (!leftenter) {
-              check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(true, re, prev, toParse, leftenter, action);
               continue;
             }
             {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_False, rea_Break, &re->un.param, nullptr, toParse);
+              insert_stack(re, prev, toParse, leftenter, rea_False, rea_Break, re->un.param, nullptr, toParse);
               continue;
             }
             break;
           case EOps::ReBehind:
             if (!leftenter) {
-              check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(true, re, prev, toParse, leftenter, action);
               continue;
             }
             if (toParse - re->param0 < 0) {
-              check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(false, re, prev, toParse, leftenter, action);
               continue;
             }
             else {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_Break, rea_False, &re->un.param, nullptr,
+              insert_stack(re, prev, toParse, leftenter, rea_Break, rea_False, re->un.param, nullptr,
                            toParse - re->param0);
               continue;
             }
             break;
           case EOps::ReNBehind:
             if (!leftenter) {
-              check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+              check_stack(true, re, prev, toParse, leftenter, action);
               continue;
             }
             if (toParse - re->param0 >= 0) {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_False, rea_Break, &re->un.param, nullptr,
+              insert_stack(re, prev, toParse, leftenter, rea_False, rea_Break, re->un.param, nullptr,
                            toParse - re->param0);
               continue;
             }
@@ -1330,8 +1463,14 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               while (re->next) re = re->next;
               break;
             }
+            if (re->branchFirstUseful && toParse < end) {
+              const auto ch = static_cast<uint32_t>(buf[toParse]);
+              if (ch < 128 && !(re->branchFirst[ch >> 6] & (uint64_t(1) << (ch & 63)))) {
+                break;
+              }
+            }
             {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_Break, &re->un.param, nullptr, toParse);
+              insert_stack(re, prev, toParse, leftenter, rea_True, rea_Break, re->un.param, nullptr, toParse);
               continue;
             }
             break;
@@ -1346,7 +1485,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             re->oldParse = toParse;
             // making branch
             if (!re->param0) {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_RangeN_step2, &re->un.param, nullptr,
+              insert_stack(re, prev, toParse, leftenter, rea_True, rea_RangeN_step2, re->un.param, nullptr,
                            toParse);
               continue;
             }
@@ -1367,11 +1506,11 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               if (re->param1)
                 re->param1--;
               else {
-                insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_False, &re->next, &re, toParse);
+                insert_stack(re, prev, toParse, leftenter, rea_True, rea_False, re->next, re, toParse);
                 continue;
               }
               {
-                insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_RangeNM_step2, &re->un.param, nullptr,
+                insert_stack(re, prev, toParse, leftenter, rea_True, rea_RangeNM_step2, re->un.param, nullptr,
                              toParse);
                 continue;
               }
@@ -1390,7 +1529,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               break;
             re->oldParse = toParse;
             if (!re->param0) {
-              insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_NGRangeN_step2, &re->next, &re, toParse);
+              insert_stack(re, prev, toParse, leftenter, rea_True, rea_NGRangeN_step2, re->next, re, toParse);
               continue;
             }
             else
@@ -1408,11 +1547,11 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
               if (re->param1)
                 re->param1--;
               else {
-                insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_False, &re->next, &re, toParse);
+                insert_stack(re, prev, toParse, leftenter, rea_True, rea_False, re->next, re, toParse);
                 continue;
               }
               {
-                insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_NGRangeNM_step2, &re->next, &re, toParse);
+                insert_stack(re, prev, toParse, leftenter, rea_True, rea_NGRangeNM_step2, re->next, re, toParse);
                 continue;
               }
             }
@@ -1422,20 +1561,16 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
             leftenter = true;
             continue;
           case EOps::ReBlockOps:
-          case EOps::ReMul:
-          case EOps::RePlus:
-          case EOps::ReQuest:
-          case EOps::ReNGMul:
-          case EOps::ReNGPlus:
-          case EOps::ReNGQuest:
           case EOps::ReSymbolOps:
             break;
         }
 
       switch (action) {
+        case rea_None:
+          break;
         case rea_False:
           if (count_elem) {
-            check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+            check_stack(false, re, prev, toParse, leftenter, action);
             continue;
           }
           else
@@ -1443,33 +1578,45 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
           break;
         case rea_True:
           if (count_elem) {
-            check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+            check_stack(true, re, prev, toParse, leftenter, action);
             continue;
           }
           else
             return true;
           break;
         case rea_Break:
-          action = -1;
+          action = rea_None;
           break;
         case rea_RangeN_step2:
-          action = -1;
-          insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_False, &re->next, &re, toParse);
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
+          insert_stack(re, prev, toParse, leftenter, rea_True, rea_False, re->next, re, toParse);
           continue;
           break;
         case rea_RangeNM_step2:
-          action = -1;
-          insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_RangeNM_step3, &re->next, &re, toParse);
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
+          insert_stack(re, prev, toParse, leftenter, rea_True, rea_RangeNM_step3, re->next, re, toParse);
           continue;
           break;
         case rea_RangeNM_step3:
-          action = -1;  //-V1037
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
           re->param1++;
-          check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+          check_stack(false, re, prev, toParse, leftenter, action);
           continue;
           break;
         case rea_NGRangeN_step2:
-          action = -1;
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
           if (re->param0)
             re->param0--;
           re = re->un.param;
@@ -1477,17 +1624,26 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
           continue;
           break;
         case rea_NGRangeNM_step2:
-          action = -1;
-          insert_stack(&re, &prev, &toParse, &leftenter, rea_True, rea_NGRangeNM_step3, &re->un.param, nullptr,
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
+          insert_stack(re, prev, toParse, leftenter, rea_True, rea_NGRangeNM_step3, re->un.param, nullptr,
                        toParse);
           continue;
           break;
         case rea_NGRangeNM_step3:
-          action = -1;
+          action = rea_None;
+          if (re == nullptr) {
+            return false;
+          }
           re->param1++;
-          check_stack(false, &re, &prev, &toParse, &leftenter, &action);
+          check_stack(false, re, prev, toParse, leftenter, action);
           continue;
           break;
+      }
+      if (re == nullptr) {
+        return false;
       }
       if (!re->next) {
         re = re->parent;
@@ -1498,7 +1654,7 @@ bool CRegExp::lowParse(SRegInfo* re, SRegInfo* prev, int toParse)
         leftenter = true;
       }
     }
-    check_stack(true, &re, &prev, &toParse, &leftenter, &action);
+    check_stack(true, re, prev, toParse, leftenter, action);
   }
 }
 
@@ -1518,8 +1674,6 @@ bool CRegExp::canStartWith(wchar ch) const
       return matchChars(ch, (*firstNode->un.word)[0]);
     case EOps::ReEnum:
       return firstNode->un.charclass->contains(ch);
-    case EOps::ReNEnum:
-      return !firstNode->un.charclass->contains(ch);
     case EOps::ReMetaSymb:
       switch (firstNode->un.metaSymbol) {
         case EMetaSymbols::ReAnyChr:
@@ -1552,14 +1706,11 @@ inline bool CRegExp::quickCheck(int toParse)
 {
   switch (firstNode->op) {
     case EOps::ReSymb:
-      return toParse < end && matchChars((*global_pattern)[toParse], firstNode->un.symbol);
+      return toParse < end && matchChars(parseBuf[toParse], firstNode->un.symbol);
     case EOps::ReWord:
-      return toParse < end && matchChars((*global_pattern)[toParse], (*firstNode->un.word)[0]);
+      return toParse < end && matchChars(parseBuf[toParse], (*firstNode->un.word)[0]);
     case EOps::ReEnum:
-    case EOps::ReNEnum:
-      return toParse < end &&
-             (firstNode->un.charclass->contains((*global_pattern)[toParse]) ==
-              (firstNode->op == EOps::ReEnum));
+      return toParse < end && firstNode->un.charclass->contains(parseBuf[toParse]);
     case EOps::ReMetaSymb:
       switch (firstNode->un.metaSymbol) {
 #ifdef COLORERMODE
@@ -1578,16 +1729,53 @@ inline bool CRegExp::quickCheck(int toParse)
   }
 }
 
-inline bool CRegExp::parseRE(int pos)
+// Cheap rejects (required chars, ^/~/$+maxLen, first-char), then NFA.
+// positionMoves slides the start; a start-anchor still fails outright.
+inline bool CRegExp::parseRE(int pos, const AsciiCharMask* subjectChars)
 {
-  if (error != EError::EOK)
+  if (error != EError::EOK || tree_root == nullptr)
     return false;
 
+  count_elem = 0;
+  parseSteps = 0;
+  stepBudgetExceeded = false;
+  // Early-out paths never reach the search loop; still drop \m/\M left on a
+  // reused end-RE from the previous parse().
+  startChange = false;
+  endChange = false;
   int toParse = pos;
+
+  if (subjectChars != nullptr) {
+    for (int i = 0; i < requiredCharsCount; i++) {
+      if (((requiredChars[i][0] & (*subjectChars)[0]) | (requiredChars[i][1] & (*subjectChars)[1])) == 0)
+        return false;
+    }
+  }
+  // An anchored pattern matches at one position only, whether or not the caller
+  // asked for a moving search.
+  const bool anchored = startAnchor != StartAnchor::None;
+  if (startAnchor == StartAnchor::LineStart && toParse != 0)
+    return false;
+#ifdef COLORERMODE
+  if (startAnchor == StartAnchor::SchemeStart && toParse != schemeStart)
+    return false;
+#endif
+
+  if (endAnchor && maxLen >= 0) {
+    // A moving search can skip forward; ^ / ~ still pin the only start.
+    if (positionMoves && startAnchor == StartAnchor::None) {
+      const int start = end - maxLen;
+      if (start > toParse) {
+        toParse = pos = start;
+      }
+    }
+    if (end - toParse > maxLen)
+      return false;
+  }
 
   if (!positionMoves && firstCharMaskUseful) {
     if (toParse >= end) return false;
-    const auto ch = static_cast<uint32_t>((*global_pattern)[toParse]);
+    const auto ch = static_cast<uint32_t>(parseBuf[toParse]);
     if (ch < 128 && !(firstCharMask[ch >> 6] & (uint64_t(1) << (ch & 63)))) return false;
   }
   if (!positionMoves && firstNode && !quickCheck(toParse))
@@ -1595,32 +1783,60 @@ inline bool CRegExp::parseRE(int pos)
 
   matches->reset();
   matches->cMatch = cMatch;
-#ifndef NAMED_MATCHES_IN_HASH
   matches->cnMatch = cnMatch;
-#endif
   do {
-    // stack=null;
+    if (positionMoves) {
+      bool skip = false;
+      if (firstCharMaskUseful) {
+        if (toParse >= end) {
+          skip = true;
+        }
+        else {
+          const auto ch = static_cast<uint32_t>(parseBuf[toParse]);
+          if (ch < 128 && !(firstCharMask[ch >> 6] & (uint64_t(1) << (ch & 63))))
+            skip = true;
+        }
+      }
+      if (!skip && firstNode && !quickCheck(toParse))
+        skip = true;
+      if (skip) {
+        if (anchored)
+          return false;
+        toParse = ++pos;
+        continue;
+      }
+    }
+    startChange = false;
+    endChange = false;
+    matches->reset();
+    matches->cMatch = cMatch;
+    matches->cnMatch = cnMatch;
     if (lowParse(tree_root, nullptr, toParse)) {
       matches->topseSanitize(cMatch - 1);
-#ifndef NAMED_MATCHES_IN_HASH
       matches->topnseSanitize(cnMatch - 1);
-#endif
       return true;
     }
-    if (!positionMoves)
+    if (stepBudgetExceeded)
+      return false;
+    if (!positionMoves || anchored)
       return false;
     toParse = ++pos;
   } while (toParse <= end);
   return false;
 }
 
-bool CRegExp::parse(const UnicodeString* str, int pos, int eol, SMatches* mtch
-#ifdef NAMED_MATCHES_IN_HASH
-                    ,
-                    PMatchHash nmtch
-#endif
-                    ,
-                    int soScheme, int posMoves)
+void CRegExp::bindSubject(const UnicodeString* str)
+{
+  global_pattern = str;
+  parseBuf = str != nullptr ? str->getBuffer() : nullptr;
+  if (parseBuf == nullptr) {
+    static const wchar empty = 0;
+    parseBuf = &empty;
+  }
+}
+
+bool CRegExp::parse(const UnicodeString* str, int pos, int eol, SMatches* mtch, int soScheme,
+                    int posMoves, const AsciiCharMask* subjectChars)
 {
   bool nms = positionMoves;
   if (posMoves != -1)
@@ -1628,34 +1844,23 @@ bool CRegExp::parse(const UnicodeString* str, int pos, int eol, SMatches* mtch
 #ifdef COLORERMODE
   schemeStart = soScheme;
 #endif
-  global_pattern = str;
+  bindSubject(str);
   end = eol;
   matches = mtch;
-#ifdef NAMED_MATCHES_IN_HASH
-  namedMatches = nmtch;
-#endif
-  bool result = parseRE(pos);
+  bool result = parseRE(pos, subjectChars);
   positionMoves = nms;
   return result;
 }
 
-bool CRegExp::parse(const UnicodeString* str, SMatches* mtch
-#ifdef NAMED_MATCHES_IN_HASH
-                    ,
-                    PMatchHash nmtch
-#endif
-)
+bool CRegExp::parse(const UnicodeString* str, SMatches* mtch)
 {
-  end = str->length();
-  global_pattern = str;
+  bindSubject(str);
+  end = str != nullptr ? str->length() : 0;
 #ifdef COLORERMODE
   schemeStart = 0;
 #endif
   matches = mtch;
-#ifdef NAMED_MATCHES_IN_HASH
-  namedMatches = nmtch;
-#endif
-  return parseRE(0);
+  return parseRE(0, nullptr);
 }
 
 /////////////////////////////////////////////////////////////////
@@ -1664,22 +1869,14 @@ bool CRegExp::parse(const UnicodeString* str, SMatches* mtch
 bool CRegExp::setRE(const UnicodeString* re)
 {
   error = EError::EERROR;
-#ifdef NAMED_MATCHES_IN_HASH
-  PMatchHash oldnamedMatches = namedMatches;
-  SMatchHash tmpMatchHash;
-  namedMatches = &tmpMatchHash;
   error = setRELow(*re);
-  namedMatches = oldnamedMatches;
-#else
-  error = setRELow(*re);
-#endif
   return error == EError::EOK;
 }
-bool CRegExp::isOk()
+bool CRegExp::isOk() const
 {
   return error == EError::EOK;
 }
-EError CRegExp::getError()
+EError CRegExp::getError() const
 {
   return error;
 }
@@ -1690,28 +1887,39 @@ bool CRegExp::setPositionMoves(bool moves)
   return true;
 }
 
-void CRegExp::clearRegExpStack()
+void CRegExp::setParseStepLimit(int limit)
 {
-  CRegExp::RegExpStack_Size = 0;
-  delete[] CRegExp::RegExpStack;
-  CRegExp::RegExpStack = nullptr;
+  parseStepLimit = limit < 1 ? 1 : limit;
 }
 
-#ifndef NAMED_MATCHES_IN_HASH
-int CRegExp::getBracketNo(const UnicodeString* brname)
+int CRegExp::getParseStepLimit() const
+{
+  return parseStepLimit;
+}
+
+bool CRegExp::exceededParseStepLimit() const
+{
+  return stepBudgetExceeded;
+}
+
+void CRegExp::clearRegExpStack()
+{
+  std::vector<StackElem>().swap(RegExpStack);
+}
+
+int CRegExp::getBracketNo(const UnicodeString* brname) const
 {
   for (int brn = 0; brn < cnMatch; brn++)
     if (UStr::caseCompare(*brname, *brnames[brn]) == 0)
       return brn;
   return -1;
 }
-UnicodeString* CRegExp::getBracketName(int no)
+const UnicodeString* CRegExp::getBracketName(int no) const
 {
   if (no >= cnMatch)
     return nullptr;
   return brnames[no];
 }
-#endif
 
 #ifdef COLORERMODE
 bool CRegExp::setBackRE(CRegExp* bkre)
@@ -1725,11 +1933,16 @@ bool CRegExp::setBackTrace(const UnicodeString* str, SMatches* trace)
   backStr = str;
   return true;
 }
-bool CRegExp::getBackTrace(const UnicodeString** str, SMatches** trace)
+bool CRegExp::getBackTrace(const UnicodeString** str, SMatches** trace) const
 {
   *str = backStr;
   *trace = backTrace;
   return true;
+}
+
+bool CRegExp::hasBackTrace() const
+{
+  return usesBackTrace;
 }
 
 #endif

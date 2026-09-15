@@ -14,9 +14,12 @@
     </documentation><contributors><![CDATA[
         Aliaksei Chapyzhenka <alex.drom@gmail.com>
         Konstantin Kushnir <chpock@gmail.com>
+        Aleksey Dobrunov <ctapmex@ctapmex.com>
     ]]></contributors></annotation>
 
     <import type="def"/>
+
+    <region name="Key" parent="def:Keyword" description="JSON object key"/>
 
     <scheme name="jsonCommentInternal">
     </scheme>
@@ -27,9 +30,7 @@
     </scheme>
 
     <scheme name='jsonQuote'>
-        <regexp match="/\\u[\dA-Fa-f]{4}/" region0="StringContent"/>
-        <regexp match="/\\x[\dA-Fa-f]{2}/" region0="StringContent"/>
-        <regexp match="/\\[\\bfnrtv]/"     region0="StringContent"/>
+        <regexp match="/\\(?:u[\dA-Fa-f]{4}|x[\dA-Fa-f]{2}|[\\bfnrtv])/" region0="StringContent"/>
     </scheme>
 
     <scheme name="jsonMETA">
@@ -42,7 +43,7 @@
     </scheme>
 
     <scheme name="Key">
-        <regexp match="/\\([\\bfnrtv&quot;&apos;\/]|x[\dA-Fa-f]{2}|u[\dA-Fa-f]{4})/x" region="VarStrong"/>
+        <inherit scheme="jsonMETA"/>
     </scheme>
 
     <scheme name="RE">
@@ -59,9 +60,9 @@
         <block start="/:/" end="/\M,|\}/" region00="SymbolStrong" scheme="json"/>
         <!-- object key -->
         <block start="/(&quot;)/" end="/(&quot;)/"
-            scheme="Key" region="Var"
-            region00='VarStrong' region01='PairStart'
-            region10='VarStrong' region11='PairEnd'
+            scheme="Key" region="Key"
+            region00='StringEdge' region01='PairStart'
+            region10='StringEdge' region11='PairEnd'
         />
         <keywords region="def:Symbol">
             <symb name=","/>
@@ -70,12 +71,14 @@
     </scheme>
 
     <scheme name="json.float">
-        <regexp match="/(-)? \B    (\.)\d+ (e[\-+]?\d+)? \b/ix" region0="NumberFloat" region1="def:Symbol" region2="def:Symbol" region3="NumberSuffix"/>
-        <regexp match="/(-)? \b \d+(\.)\d* (e[\-+]?\d+)? \b/ix" region0="NumberFloat" region1="def:Symbol" region2="def:Symbol" region3="NumberSuffix"/>
-        <regexp match="/(-)? \b \d+        (e[\-+]?\d+)  \b/ix" region0="NumberFloat" region1="def:Symbol"                      region2="NumberSuffix"/>
+        <regexp match="/(?{def:Symbol}-)(?{def:Symbol}\.)\d+(?:[eE][\-+]?\d+)?/" region0="NumberFloat"/>
+        <regexp match="/(?{def:Symbol}\.)\d+(?:[eE][\-+]?\d+)?/" region0="NumberFloat"/>
+        <regexp match="/(?{def:Symbol}-)\d+(?:(?{def:Symbol}\.)\d*(?:[eE][\-+]?\d+)?|[eE][\-+]?\d+)/" region0="NumberFloat"/>
+        <regexp match="/\d+(?:(?{def:Symbol}\.)\d*(?:[eE][\-+]?\d+)?|[eE][\-+]?\d+)/" region0="NumberFloat"/>
     </scheme>
     <scheme name="json.decimal">
-        <regexp match="/(-)?\b\d+ (ul{0,2}|l{1,2}u?|i64|i128)?\b/ix" region0="NumberDec" region1="def:Symbol" region2="NumberSuffix"/>
+        <regexp match="/(?{def:Symbol}-)\d+/" region0="NumberDec"/>
+        <regexp match="/\d+/" region0="NumberDec"/>
     </scheme>
     <!-- JSON only allows integers and floats -->
     <scheme name="json.numbers">

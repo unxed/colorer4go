@@ -5,11 +5,15 @@ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 xsi:schemaLocation="http://colorer.sf.net/2003/hrc http://colorer.sf.net/2003/hrc.xsd">
 
 <type name="markdown">
-<annotation><documentation><![CDATA[
+<annotation>
+<documentation><![CDATA[
 
-markdown.hrc by Roman Kuzmin (nightroman), 2025-05-09
+markdown.hrc by Roman Kuzmin (nightroman), 2026-01-30
 
-* Use markdown2 for extensions.
+* Fenced code (``` / ~~~) with a common language tag is highlighted
+  (python, javascript, typescript, jsx, json, yaml, html, xml, css, sql,
+  bash/sh, java, csharp, c, c++, go, rust, php, ruby, kotlin, lua,
+  toml, diff). Use markdown2 for other languages.
 * Opened spans are always colored.
 * Blockquotes are partially parsed.
 * List levels 4: only items are parsed.
@@ -18,14 +22,44 @@ markdown.hrc by Roman Kuzmin (nightroman), 2025-05-09
 
 Inline HTML
 
-* ALLCAPS tags are treated separately, not affecting markdown, see #6: https://github.github.com/gfm/#html-block
-* Other HTML is treated as XML and should be well formed.
+* HTML highlighting applies to CommonMark HTML blocks https://spec.commonmark.org/0.31.2/#html-blocks
+* Inline HTML tags are highlighted as tags only and do not disable markdown parsing inside.
 
 Inline JavaScript
 
 * <% %> marks Obsidian Templater blocks.
 
-]]></documentation></annotation>
+Contributors:
+  Alexey Shelaev
+]]></documentation>
+<contributors><![CDATA[
+  Aleksey Dobrunov <ctapmex@ctapmex.com>
+]]></contributors>
+</annotation>
+
+<import type="c"/>
+<import type="cpp"/>
+<import type="csharp"/>
+<import type="css"/>
+<import type="diff"/>
+<import type="go"/>
+<import type="html"/>
+<import type="java"/>
+<import type="jScript"/>
+<import type="json"/>
+<import type="jsx"/>
+<import type="kotlin"/>
+<import type="lua"/>
+<import type="php"/>
+<import type="python"/>
+<import type="ruby"/>
+<import type="rust"/>
+<import type="shell"/>
+<import type="sql"/>
+<import type="toml"/>
+<import type="typescript"/>
+<import type="xml"/>
+<import type="yaml"/>
 
 <region name="Anchor"        parent="def:LabelStrong"    description="{#Anchor}"/>
 <region name="Code"          parent="def:TypeKeyword"    description="`Code` spans, indented and fenced blocks."/>
@@ -46,10 +80,13 @@ Inline JavaScript
 <region name="BlindMark"     parent="def:Tag"            description="Markup and information not visible in HTML."/>
 <region name="Abbreviation"  parent="BlindMark"          description="*[Abbreviation]: Text"/>
 <region name="FenceMark"     parent="BlindMark"          description="~~~"/>
+<region name="FenceLang"     parent="BlindMark"          description="Language tag after a fence"/>
 <region name="HeadMark"      parent="BlindMark"          description="#, ##, ..., ######"/>
 <region name="LinkMark"      parent="BlindMark"          description="[]() or [][] or []"/>
+<region name="LinkDest"      parent="def:URI"            description="Link destination in [Ref]: Address"/>
+<region name="LinkTitle"     parent="def:String"         description="Optional title in [Ref]: Address 'Title'"/>
 <region name="QuoteMark"     parent="BlindMark"          description=">, >>, ..."/>
-<region name="Reference"     parent="BlindMark"          description="[Ref]: Address 'Title'"/>
+<region name="Reference"     parent="BlindMark"          description="[Ref]: prefix of a link reference definition"/>
 
 <region name="TemplateStart" parent="def:InsertionStart"/>
 <region name="TemplateEnd" parent="def:InsertionEnd"/>
@@ -71,8 +108,10 @@ Inline JavaScript
 
 <entity name="Abbr" value=" {,3}\*\[[^\]]+\]:"/>
 <entity name="Email" value="[^@&gt;]+@[^.&gt;]+\.[^&gt;]+"/>
-<entity name="Fence" value="\~{3,}\s*$"/>
+<entity name="Fence" value="(?:`{3,}|\~{3,})"/>
 <entity name="FenceMark" value="(?{FenceMark}(?:`{3,}|\~{3,}))"/>
+<entity name="FenceOpen" value="(?{start}^[ \t]*%FenceMark;)\s*[\{]?\s*"/>
+<entity name="FenceClose" value="(?{end}^[ \t]*(?{FenceMark}\y{FenceMark}))\s*$"/>
 <entity name="Head" value="#{1,6}"/>
 <entity name="ID" value="[a-zA-Z][a-zA-Z0-9_\-:.]*"/>
 <entity name="List1" value="(?:[*+\-]|\d+\.)\s+\S"/>
@@ -86,20 +125,21 @@ Inline JavaScript
 <entity name="Html" value="(?:ADDRESS|ARTICLE|ASIDE|BASE|BASEFONT|BLOCKQUOTE|BODY|CAPTION|CENTER|COL|COLGROUP|DD|DETAILS|DIALOG|DIR|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|FRAME|FRAMESET|H1|H2|H3|H4|H5|H6|HEAD|HEADER|HR|HTML|IFRAME|LEGEND|LI|LINK|MAIN|MENU|MENUITEM|NAV|NOFRAMES|OL|OPTGROUP|OPTION|P|PARAM|SECTION|SOURCE|SUMMARY|TABLE|TBODY|TD|TFOOT|TH|THEAD|TITLE|TR|TRACK|UL)"/>
 
 <entity name="Top" value="^(?:\s*$|%Rule;|%Head;|%Ref;|%Abbr;)"/>
-<entity name="LEnd" value="^(?:%Top;|\s*%List2;|%Fence;|%i3;%Quote;)?="/>
-<entity name="PEnd" value="^(?:%Top;| {,3}:\s+\S|%Fence;|%i3;%Quote;)?="/>
+<entity name="Blank" value="^\s*$"/>
+<entity name="LEnd" value="^(?:%Top;|\s*%List2;|{,3}%Fence;|%i3;%Quote;)?="/>
+<entity name="PEnd" value="^(?:%Top;| {,3}:\s+\S|{,3}%Fence;|%i3;%Quote;)?="/>
 
 <scheme name="Escape">
   <regexp match="/(?{Escape}\\([\!\&quot;\#\$\%\&amp;\'\(\)\*\+\,\-\.\/\:\;\&lt;\=\&gt;\?\@\[\\\]\^\_\`\{\|\}\~]|$))/"/>
 </scheme>
 <scheme name="CodeSpan">
   <block scheme="Template" region="Code"
-  start="/(?{start}`+)/" end="/(?{end}\y{start})|%LEnd;/"/>
+  start="/(^[ \t]*`{3,})?!(?{start}`+)/" end="/(?{end}\y{start})|%LEnd;/"/>
 </scheme>
 
 <scheme name="PCodeSpan">
   <block scheme="Template" region="Code"
-  start="/(?{start}`+)/" end="/(?{end}\y{start})|%PEnd;/"/>
+  start="/(^[ \t]*`{3,})?!(?{start}`+)/" end="/(?{end}\y{start})|%PEnd;/"/>
 </scheme>
 
 <scheme name="Link">
@@ -134,26 +174,132 @@ Inline JavaScript
 <scheme name="Html">
   <regexp match="/(?{LinkMark}&lt;)(?{LinkText}%URI;|%Email;)(?{LinkMark}&gt;)/"/>
 
+  <block scheme="def:Comment" region="def:Comment"
+    start="/(?{start}&lt;!--)/" end="/(?{end}--&gt;)/"
+  />
   <block scheme="xml:Attribute"
-    start="/(?{start}(?{xml:element.start.lt}&lt;)(?{xml:element.start.name}%Html;)\b)/"
-    end="/(?{end}(?{xml:element.start.gt}&gt;))/"
+    start="/(?{start}(?{xml:element.start.lt}&lt;)(?{xml:element.start.name}%ID;)\b)/"
+    end="/(?{end}(?{xml:element.start.gt}\/?&gt;))/"
   />
 
-  <regexp match="/(?{xml:element.end.lt}&lt;\/)(?{xml:element.end.name}%Html;)(?{xml:element.end.gt}&gt;)/"/>
+  <regexp match="/(?{xml:element.end.lt}&lt;\/)(?{xml:element.end.name}%ID;)(?{xml:element.end.gt}&gt;)/"/>
 
-  <block scheme="xml:xml"
-    start="/\M&lt;(?:!--|\d?!\w+(?:\s|\/?&gt;|$))/"
-    end="//"
+</scheme>
+
+<scheme name="HtmlTags">
+    <inherit scheme="html:html">
+        <virtual scheme="html:htmlPairs" subst-scheme="def:empty"/>
+    </inherit>
+</scheme>
+
+<scheme name="HtmlBlock">
+  <!-- HTML Block Type 1 (pre/script/style/textarea)  -->
+  <block scheme="html:html"
+    start="/(?{start}%i3;(?{html:htmlTagBr}&lt;(?{html:htmlOpenTag}(?{starttag}pre|script|style|textarea))(?:\s+[^&lt;&gt;]*?)?(?:&gt;|$)))/i"
+    end="/(?{end}(?{html:htmlTagBr}&lt;\/(?{html:htmlCloseTag}\y{starttag}\b\s*)&gt;))/i"
   />
+
+  <!-- HTML Block Type 2 (comment)  -->
+  <!-- handled by Html scheme  -->
+
+  <!-- HTML Block Type 3 (processing instruction)  -->
+  <block scheme="html:htmlCoreParams"
+    start="/(?{start}%i3;(?{html:htmlTagBr}&lt;\?%ID;*))/"
+    end="/(?{end}(?{html:htmlTagBr}\?&gt;))/"
+  />
+
+  <!-- HTML Block Type 4 (declaration)  -->
+  <block scheme="html:html"
+    start="/(?{start}%i3;&lt;![A-Za-z])/i"
+    end="/(?{end}&gt;)/"
+    region="html:htmlDirective"
+  />
+
+  <!-- HTML Block Type 5 (CDATA)  -->
+  <block scheme="html:html"
+    start="/(?{start}%i3;(?{BlindMark}&lt;!\[CDATA\[))/"
+    end="/(?{end}(?{BlindMark}\]\]&gt;))/"
+  />
+
+  <!-- HTML Block Type 6 (block tags, blank line ends)  -->
+  <block scheme="HtmlTags"
+    start="/\M(?:%i3;&lt;\/?%Html;(?:\s|\t|$|&gt;|\/&gt;))/i"
+    end="/(?:%Blank;)/"
+  />
+
+  <!-- HTML Block Type 7 (complete tag line, blank line ends) -->
+  <block scheme="HtmlTags"
+    start="/\M(?:%i3;(?:&lt;%ID;(?:\s+[^&lt;&gt;]*?)?\/?&gt;|&lt;\/%ID;\s*&gt;)[ \t]*$)/i"
+    end="/(?:%Blank;)/"
+  />
+</scheme>
+
+<scheme name="fencedLang">
+  <!-- more specific tags before shorter aliases (c++ before c, csharp before c, tsx before ts) -->
+  <block start="/%FenceOpen;(?{FenceLang}(?:javascript|js|node|mjs|cjs))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="jScript:jScript" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:typescript|mts|cts|ts))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="typescript:typescript" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:tsx|jsx))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="jsx:jsx" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:python|py))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="python:python" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:jsonc|json))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="json:json" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:yaml|yml))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="yaml:yaml" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:html|htm))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="html:html" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}xml)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="xml:xml" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}css)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="css:css" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}sql)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="sql:sql" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:bash|shell|zsh|ksh|console|sh))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="shell:shell" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}java)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="java:java" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:csharp|c\#|cs))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="csharp:csharp" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:c\+\+|cpp|cxx))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="cpp:cpp" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}c)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="c:c" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:golang|go))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="go:go" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:rust|rs))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="rust:rust" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}php)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="php:phpScript" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:ruby|rb))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="ruby:ruby" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:kotlin|kts|kt))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="kotlin:kotlin" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}lua)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="lua:lua" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}toml)(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="toml:toml" content-priority="low"/>
+  <block start="/%FenceOpen;(?{FenceLang}(?:diff|patch))(\w)?!.*$/i" end="/%FenceClose;/"
+         scheme="diff:diff" content-priority="low"/>
+</scheme>
+
+<scheme name="fenced">
+  <inherit scheme="fencedLang"/>
+  <block scheme="Template" region="Code"
+  start="/(?{start}^[ \t]*%FenceMark;).*$/" end="/(?{end}^[ \t]*(?{FenceMark}\y{FenceMark}))\s*$/"/>
 </scheme>
 
 <scheme name="Base">
   <inherit scheme="Wrap"/>
   <inherit scheme="Escape"/>
   <inherit scheme="CodeSpan"/>
+  <regexp match="/\[([ xX])\]/" region="ListMark"/>
   <inherit scheme="LinkSpan"/>
   <inherit scheme="Template"/>
+  <inherit scheme="HtmlBlock"/>
   <inherit scheme="Html"/>
+  <regexp match="/\|/" region="ShownMark"/>
 </scheme>
 
 <scheme name="EmSpan">
@@ -201,6 +347,7 @@ Inline JavaScript
 </scheme>
 
 <scheme name="Quote">
+  <inherit scheme="HtmlBlock"/>
   <inherit scheme="Wrap"/>
   <inherit scheme="Escape"/>
   <inherit scheme="Template"/>
@@ -221,6 +368,15 @@ Inline JavaScript
   </inherit>
 </scheme>
 
+<scheme name="ReferenceDef">
+  <!-- <destination> -->
+  <regexp match="/\s*(?{LinkMark}&lt;)(?{LinkDest}[^&gt;]*)(?{LinkMark}&gt;)/"/>
+  <!-- destination; first char is not a title delimiter -->
+  <regexp match="/\s*(?{LinkDest}[^\s&lt;&quot;'\(]\S*)/"/>
+  <!-- "title" | 'title' | (title) -->
+  <regexp match="/\s*(?{LinkTitle}(?:&quot;[^&quot;]*&quot;|'[^']*'|\([^)]*\)))/"/>
+</scheme>
+
 <scheme name="Head">
   <regexp match="/(?{HeadMark}#*\s*)?(?{Anchor}\{#%ID;\})(?{HeadMark}\s*#*\s*)$/"/>
   <regexp match="/(?{HeadMark}#+\s*)$/"/>
@@ -234,8 +390,11 @@ Inline JavaScript
 </scheme>
 
 <scheme name="Item3">
+  <inherit scheme="HtmlBlock"/>
   <block scheme="Template" region="QuoteText"
   start="/(?{start}%s12;%QuoteMark;)/" end="/(?{end})\M(?:%Top;|^\s+%List1;|%x4;{,3}%Fence;|%i11;%Quote;)/"/>
+
+  <inherit scheme="fenced"/>
 
   <block scheme="Template" region="Code"
   start="/(?{start}%x12;%FenceMark;)/" end="/(?{end}%x12;(?{FenceMark}\y{FenceMark})\s*$)/"/>
@@ -259,8 +418,11 @@ Inline JavaScript
 </scheme>
 
 <scheme name="Item2">
+  <inherit scheme="HtmlBlock"/>
   <block scheme="Template" region="QuoteText"
   start="/(?{start}%s8;%QuoteMark;)/" end="/(?{end})\M(?:%Top;|^\s+%List1;|%x4;{,2}%Fence;|%i7;%Quote;)/"/>
+
+  <inherit scheme="fenced"/>
 
   <block scheme="Template" region="Code"
   start="/(?{start}%x8;%FenceMark;)/" end="/(?{end}%x8;(?{FenceMark}\y{FenceMark})\s*$)/"/>
@@ -284,8 +446,11 @@ Inline JavaScript
 </scheme>
 
 <scheme name="Item">
+  <inherit scheme="HtmlBlock"/>
   <block scheme="Template" region="QuoteText"
   start="/(?{start}%s4;%QuoteMark;)/" end="/(?{end})\M(?:%Top;|^\s+%List1;|%x4;%Fence;|%i3;%Quote;)/"/>
+
+  <inherit scheme="fenced"/>
 
   <block scheme="Template" region="Code"
   start="/(?{start}%x4;%FenceMark;)/" end="/(?{end}%x4;(?{FenceMark}\y{FenceMark})\s*$)/"/>
@@ -311,6 +476,8 @@ Inline JavaScript
 <scheme name="markdown">
   <!--user extensions-->
   <inherit scheme="markdown2:markdown2" />
+  <inherit scheme="HtmlBlock"/>
+
 
   <regexp match="/^(?{Rule}%Rule;)/"/>
 
@@ -323,10 +490,13 @@ Inline JavaScript
   <block scheme="Template" region="Code"
   start="/(?{start}^ {4,}|\t+)\S.*/" end="/(?{end})\M%i3;\S/"/>
 
-  <block scheme="Template" region="Code"
-  start="/(?{start}^%FenceMark;).*$/" end="/(?{end}^(?{FenceMark}\y{FenceMark}))\s*$/"/>
+  <inherit scheme="fenced"/>
 
-  <regexp match="/^(?{def:Outlined}(?{Reference}%Ref;.*))/"/>
+  <block scheme="Template" region="Code"
+  start="/(?{start}^[ \t]*%FenceMark;).*$/" end="/(?{end}^[ \t]*(?{FenceMark}\y{FenceMark}))\s*$/"/>
+
+  <block scheme="ReferenceDef" region="def:Outlined"
+  start="/^(?{def:Outlined}(?{Reference}%Ref;))/" end="/$/"/>
 
   <regexp match="/^(?{Abbreviation}%Abbr;.*)/"/>
 
@@ -335,6 +505,11 @@ Inline JavaScript
 
   <block scheme="List"
   start="/(?{start}%i3;%ListMark;)/" end="/(?{end})/"/>
+
+  <regexp match="/^ {,3}(?:\|?\s*:?-+:?\s*){2,}\|?\s*$/" region="Rule"/>
+
+  <block scheme="Text"
+  start="/^ {,3}\|?=/" end="/$/"/>
 
   <block scheme="Para"
   start="/\M(?{start}%i3;)\S/" end="/(?{end})%PEnd;/"/>

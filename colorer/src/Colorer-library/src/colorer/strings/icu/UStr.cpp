@@ -64,7 +64,7 @@ std::unique_ptr<CharacterClass> UStr::createCharClass(const UnicodeString& ccs, 
     return nullptr;
   }
 
-  auto cc = std::make_unique<icu::UnicodeSet>();
+  auto cc = std::make_unique<CharacterClass>();
   icu::UnicodeSet cc_temp;
   bool inverse = false;
   UChar prev_char = BAD_WCHAR;
@@ -84,6 +84,7 @@ std::unique_ptr<CharacterClass> UStr::createCharClass(const UnicodeString& ccs, 
       if (inverse) {
         cc->complement();
       }
+      cc->freeze();
       return cc;
     }
     if (ccs[pos] == '{') {
@@ -211,9 +212,9 @@ std::unique_ptr<CharacterClass> UStr::createCharClass(const UnicodeString& ccs, 
     }
     cc->add(ccs[pos]);
     if (ignore_case) {
-      cc->add(u_tolower(prev_char));
-      cc->add(u_toupper(prev_char));
-      cc->add(u_totitle(prev_char));
+      cc->add(u_tolower(ccs[pos]));
+      cc->add(u_toupper(ccs[pos]));
+      cc->add(u_totitle(ccs[pos]));
     }
     prev_char = ccs[pos];
   }
@@ -245,7 +246,7 @@ int8_t UStr::caseCompare(const UnicodeString& str1, const UnicodeString& str2)
   return str1.caseCompare(str2, U_FOLD_CASE_DEFAULT);
 }
 
-int8_t UStr::caseCompare(const UnicodeString& str1, int str1_pos, int str1_len, const UnicodeString& str2);
+int8_t UStr::caseCompare(const UnicodeString& str1, int str1_pos, int str1_len, const UnicodeString& str2)
 {
   return str1.caseCompare(str1_pos, str1_len, str2, U_FOLD_CASE_DEFAULT);
 }
