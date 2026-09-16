@@ -29,6 +29,8 @@ __attribute__((used)) const char* colorer_get_file_type_description(void* handle
 __attribute__((used)) int colorer_load_file_type(void* handle, const char* name);
 __attribute__((used)) int colorer_parse_line(void* handle, const char* line_utf8, int line_len);
 __attribute__((used)) const void* colorer_get_regions(void* handle);
+__attribute__((used)) int colorer_pair_count(void* handle);
+__attribute__((used)) const void* colorer_get_pairs(void* handle);
 __attribute__((used)) void colorer_forget_before(void* handle, int lno);
 __attribute__((used)) int colorer_first_line(void* handle);
 __attribute__((used)) int colorer_next_line(void* handle);

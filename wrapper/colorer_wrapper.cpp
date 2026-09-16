@@ -129,9 +129,31 @@ public:
     }
 };
 
+// One paired token of a line: a region under def:PairStart or def:PairEnd.
+// Colorer makes those regions special (def:PairStart and def:PairEnd are
+// children of def:Special), so they are not among the regions harvest()
+// returns; FarColorer draws them only for the pair under the cursor. The
+// fields are those of WasmRegion, with opens in place of the name.
+struct WasmPair {
+    int start;
+    int end;
+    int opens;  // 1 for def:PairStart, 0 for def:PairEnd
+    unsigned int fore;
+    unsigned int back;
+    unsigned int style;
+    int isForeSet;
+    int isBackSet;
+};
+
 class WasmRegionHandler : public LineRegionsSupport {
 public:
     std::vector<WasmRegion> regions;
+    std::vector<WasmPair> pairs;
+    // Resolved on first use: def.hrc is loaded with the first type that
+    // imports it, and until then the library has no such regions.
+    const Region* pair_start = nullptr;
+    const Region* pair_end = nullptr;
+    HrcLibrary* library = nullptr;
     std::unordered_map<const Region*, std::string>& name_cache;
     WasmLineSource* line_source = nullptr;
 
@@ -140,13 +162,51 @@ public:
 
     void clear() {
         regions.clear();
+        pairs.clear();
         LineRegionsSupport::clear();
+    }
+
+    // Whether region is a pair start (1), a pair end (0), or neither (-1),
+    // tested as BaseEditor::getPairMatch and searchPair test it.
+    int pairKind(const Region* region) {
+        if (library && (!pair_start || !pair_end)) {
+            UnicodeString start_name("def:PairStart");
+            UnicodeString end_name("def:PairEnd");
+            pair_start = library->getRegion(&start_name);
+            pair_end = library->getRegion(&end_name);
+        }
+        if (pair_start && region->hasParent(pair_start)) return 1;
+        if (pair_end && region->hasParent(pair_end)) return 0;
+        return -1;
+    }
+
+    static void styleOf(const LineRegion* lr, unsigned int& fore, unsigned int& back, unsigned int& style,
+                        int& isForeSet, int& isBackSet) {
+        fore = back = style = 0;
+        isForeSet = isBackSet = 0;
+        if (!lr->rdef) return;
+        const StyledRegion* sr = StyledRegion::cast(lr->rdef);
+        if (!sr) return;
+        fore = sr->fore;
+        back = sr->back;
+        style = sr->style;
+        isForeSet = sr->isForeSet ? 1 : 0;
+        isBackSet = sr->isBackSet ? 1 : 0;
     }
 
     void harvest(size_t lno) {
         regions.clear();
+        pairs.clear();
         for (LineRegion* lr = getLineRegions(lno); lr != nullptr; lr = lr->next) {
             if (lr->special) {
+                if (lr->region != nullptr) {
+                    int kind = pairKind(lr->region);
+                    if (kind >= 0) {
+                        WasmPair pair{lr->start, lr->end, kind, 0, 0, 0, 0, 0};
+                        styleOf(lr, pair.fore, pair.back, pair.style, pair.isForeSet, pair.isBackSet);
+                        pairs.push_back(pair);
+                    }
+                }
                 continue;
             }
             if (lr->region == nullptr && lr->rdef == nullptr) {
@@ -260,6 +320,7 @@ void* colorer_init(const char* catalog_path) {
     session->factory = std::make_unique<ParserFactory>();
     UnicodeString cat(catalog_path);
     session->factory->loadCatalog(&cat);
+    session->region_handler.library = &session->factory->getHrcLibrary();
     session->parser = session->factory->createTextParser();
     session->parser->setLineSource(&session->line_source);
     session->parser->setRegionHandler(&session->region_handler);
@@ -454,6 +515,22 @@ const void* colorer_get_regions(void* handle) {
     auto* session = static_cast<ColorerSession*>(handle);
     if (!session) return nullptr;
     return session->region_handler.regions.data();
+}
+
+static_assert(sizeof(WasmPair) == 32, "WasmPair must pack to 32 bytes for the batched Go reader");
+
+// The pairs of the line colorer_parse_line parsed last, in the order Colorer
+// reported them; valid until the next parse or reset.
+int colorer_pair_count(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return 0;
+    return static_cast<int>(session->region_handler.pairs.size());
+}
+
+const void* colorer_get_pairs(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return nullptr;
+    return session->region_handler.pairs.data();
 }
 
 void colorer_forget_before(void* handle, int lno) {

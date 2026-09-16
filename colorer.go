@@ -55,6 +55,26 @@ type Region struct {
 	IsBackSet bool
 }
 
+// Pair is one paired token of a line: a region under def:PairStart (Opens) or
+// def:PairEnd. Colorer makes these regions special, so ParseLine does not
+// return them — FarColorer draws a pair only when the cursor is on it. Start
+// and End are offsets like Region's; the colours are the pair's own assign.
+//
+// Matching is left to the caller, as BaseEditor::searchPair does it: from the
+// pair under the cursor walk the following pairs (or, for a pair end, the
+// preceding ones) across lines, counting +1 for each start and -1 for each end
+// from 1 (or -1), and the pair where the count reaches zero is the match.
+type Pair struct {
+	Start     int
+	End       int
+	Opens     bool
+	Fore      uint32
+	Back      uint32
+	Style     uint32
+	IsForeSet bool
+	IsBackSet bool
+}
+
 type RegionDefine struct {
 	Fore      uint32
 	Back      uint32
@@ -863,6 +883,53 @@ func (s *Session) LoadFileType(name string) (bool, error) {
 // fields (int, unsigned int, and a pointer all being 4 bytes on wasm32), with
 // no padding — a static_assert on the C++ side guards this.
 const wasmRegionSize = 32
+
+// ParseLinePairs is ParseLine that also returns the line's paired tokens.
+func (s *Session) ParseLinePairs(line string) ([]Region, []Pair, error) {
+	regions, err := s.ParseLine(line)
+	if err != nil {
+		return nil, nil, err
+	}
+	countFn, err := s.exportedFn("colorer_pair_count")
+	if err != nil {
+		return nil, nil, err
+	}
+	ret, err := s.call(countFn, "colorer_pair_count", uint64(s.ptr))
+	if err != nil {
+		return nil, nil, err
+	}
+	count := int(int32(ret[0]))
+	if count <= 0 {
+		return regions, nil, nil
+	}
+	pairsFn, err := s.exportedFn("colorer_get_pairs")
+	if err != nil {
+		return nil, nil, err
+	}
+	ptrRes, err := s.call(pairsFn, "colorer_get_pairs", uint64(s.ptr))
+	if err != nil {
+		return nil, nil, err
+	}
+	buf, ok := s.mod.Memory().Read(uint32(ptrRes[0]), uint32(count*wasmRegionSize))
+	if !ok {
+		return nil, nil, errors.New("failed to read pair array from wasm memory")
+	}
+	pairs := make([]Pair, count)
+	for i := range pairs {
+		rec := buf[i*wasmRegionSize:]
+		pairs[i] = Pair{
+			Start:     int(int32(binary.LittleEndian.Uint32(rec[0:4]))),
+			End:       int(int32(binary.LittleEndian.Uint32(rec[4:8]))),
+			Opens:     binary.LittleEndian.Uint32(rec[8:12]) != 0,
+			Fore:      binary.LittleEndian.Uint32(rec[12:16]),
+			Back:      binary.LittleEndian.Uint32(rec[16:20]),
+			Style:     binary.LittleEndian.Uint32(rec[20:24]),
+			IsForeSet: binary.LittleEndian.Uint32(rec[24:28]) != 0,
+			IsBackSet: binary.LittleEndian.Uint32(rec[28:32]) != 0,
+		}
+	}
+	return regions, pairs, nil
+}
 
 func (s *Session) ParseLine(line string) ([]Region, error) {
 	if s.lineBufferFn == nil {

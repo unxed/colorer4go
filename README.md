@@ -104,6 +104,19 @@ func (s *Session) ParseLine(line string) ([]Region, error)
 * `line`: A single line of UTF-8 encoded text.
 * Returns a slice of `Region` tokens.
 
+#### `func (*Session) ParseLinePairs`
+`ParseLine` that also returns the line's paired tokens — brackets, `begin`/`end`
+and the like, the regions under `def:PairStart` and `def:PairEnd`.
+```go
+func (s *Session) ParseLinePairs(line string) ([]Region, []Pair, error)
+```
+Colorer makes pair regions special, so they are not among the regions
+`ParseLine` returns: FarColorer draws a pair only when the cursor is on it.
+Matching is the caller's, as in `BaseEditor::searchPair`: from the pair under
+the cursor, walk the following pairs (for a pair end, the preceding ones)
+across lines counting +1 per start and -1 per end, starting from 1 (or -1);
+the pair where the count reaches zero is the match.
+
 #### `func (*Session) ForgetBefore`
 Releases the stored text of every session line below `line`.
 ```go
