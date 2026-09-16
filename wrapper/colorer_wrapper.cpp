@@ -195,6 +195,11 @@ struct ColorerSession {
     std::string last_hrd_name;
     std::string last_hrd_desc;
 
+    // Filled by colorer_enum_file_types, read by the getters by index, the way
+    // hrd_cache is. last_type_str holds the string the last getter returned.
+    std::vector<FileType*> type_cache;
+    std::string last_type_str;
+
     // Reused across colorer_parse_line calls so a session that has already
     // seen a line at least this long does not pay for a malloc/free pair on
     // every subsequent one. Only grows: parse_line copies the bytes into a
@@ -369,6 +374,55 @@ int colorer_select_type(void* handle, const char* file_name, const char* first_l
     session->factory->getHrcLibrary().loadFileType(type);
     session->parser->setFileType(type);
     return 1;
+}
+
+// Lists the file types the catalog and the user's schemes declare, in the
+// library's order, for the getters below. Returns the count.
+int colorer_enum_file_types(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return 0;
+    session->type_cache.clear();
+    auto& library = session->factory->getHrcLibrary();
+    for (unsigned int idx = 0;; idx++) {
+        FileType* type = library.enumerateFileTypes(idx);
+        if (!type) break;
+        session->type_cache.push_back(type);
+    }
+    return static_cast<int>(session->type_cache.size());
+}
+
+static const char* file_type_string(void* handle, int index, const UnicodeString& (FileType::*field)() const) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || index < 0 || static_cast<size_t>(index) >= session->type_cache.size()) return nullptr;
+    session->last_type_str = UStr::to_stdstr(&(session->type_cache[index]->*field)());
+    return session->last_type_str.c_str();
+}
+
+const char* colorer_get_file_type_name(void* handle, int index) {
+    return file_type_string(handle, index, &FileType::getName);
+}
+
+const char* colorer_get_file_type_group(void* handle, int index) {
+    return file_type_string(handle, index, &FileType::getGroup);
+}
+
+const char* colorer_get_file_type_description(void* handle, int index) {
+    return file_type_string(handle, index, &FileType::getDescription);
+}
+
+// Loads the scheme of the named file type — what colorer_select_type does for
+// the type it picks — without selecting it. Returns 1 when the type now has a
+// base scheme, 0 when it loaded without one, -1 when no type has that name.
+// A scheme Colorer cannot parse aborts the call, as it does on selection.
+int colorer_load_file_type(void* handle, const char* name) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !name) return -1;
+    UnicodeString type_name(name);
+    auto& library = session->factory->getHrcLibrary();
+    FileType* type = library.getFileType(&type_name);
+    if (!type) return -1;
+    library.loadFileType(type);
+    return type->getBaseScheme() != nullptr ? 1 : 0;
 }
 
 int colorer_parse_line(void* handle, const char* line_utf8, int line_len) {

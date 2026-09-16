@@ -79,6 +79,23 @@ func (s *Session) SelectType(fileName, firstLine string) (bool, error)
 * `firstLine`: The first line of the file, used for shebang or header matching.
 * Returns `true` if a suitable scheme was found and loaded successfully.
 
+#### `func (*Session) FileTypes` and `func (*Session) LoadFileType`
+The file types the session knows, and loading one's scheme without selecting it.
+```go
+type FileType struct {
+	Name        string // "json"
+	Group       string // "rare"
+	Description string // "JSON"
+}
+func (s *Session) FileTypes() ([]FileType, error)
+func (s *Session) LoadFileType(name string) (bool, error)
+```
+Colorer parses a type's scheme only when the type is first used, so a scheme
+it cannot parse goes unnoticed until a file of that type is opened.
+`LoadFileType` does that parsing on demand — it returns whether the type has a
+scheme afterwards, and a `*FatalError` where selecting the type would have
+failed — so loading every listed type checks a whole configuration up front.
+
 #### `func (*Session) ParseLine`
 Parses a single line of text and returns a list of highlighting regions.
 ```go

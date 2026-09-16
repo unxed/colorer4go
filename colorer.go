@@ -785,6 +785,80 @@ func (s *Session) SelectType(fileName, firstLine string) (bool, error) {
 	return ret[0] != 0, nil
 }
 
+// FileType is one file type the catalog or the user's schemes declare.
+type FileType struct {
+	Name        string // the HRC type name, e.g. "json"
+	Group       string // the group menus list it under, e.g. "rare"
+	Description string // the human name, e.g. "JSON"
+}
+
+// FileTypes lists the file types the session knows, in the library's order:
+// the catalog's own, then the user's (WithUserHRC).
+func (s *Session) FileTypes() ([]FileType, error) {
+	enumFn, err := s.exportedFn("colorer_enum_file_types")
+	if err != nil {
+		return nil, err
+	}
+	getters := make([]api.Function, 3)
+	for i, name := range []string{"colorer_get_file_type_name", "colorer_get_file_type_group", "colorer_get_file_type_description"} {
+		if getters[i], err = s.exportedFn(name); err != nil {
+			return nil, err
+		}
+	}
+	ret, err := s.call(enumFn, "colorer_enum_file_types", uint64(s.ptr))
+	if err != nil {
+		return nil, err
+	}
+	count := int(int32(ret[0]))
+	types := make([]FileType, 0, count)
+	for i := 0; i < count; i++ {
+		var fields [3]string
+		for f, fn := range getters {
+			res, err := s.call(fn, "colorer_get_file_type_string", uint64(s.ptr), uint64(i))
+			if err != nil {
+				return nil, err
+			}
+			if res[0] != 0 {
+				if fields[f], err = readString(s.mod.Memory(), uint32(res[0])); err != nil {
+					return nil, err
+				}
+			}
+		}
+		types = append(types, FileType{Name: fields[0], Group: fields[1], Description: fields[2]})
+	}
+	return types, nil
+}
+
+// LoadFileType loads the scheme of the named file type, as SelectType does
+// for the type it picks, without selecting it. That is where a scheme Colorer
+// cannot parse shows up, so loading every type finds such a scheme before a
+// file of its type is opened.
+//
+// It reports whether the type has a scheme afterwards. A name no type has is an
+// error; a scheme Colorer cannot parse is a *FatalError, as on selection.
+func (s *Session) LoadFileType(name string) (bool, error) {
+	fn, err := s.exportedFn("colorer_load_file_type")
+	if err != nil {
+		return false, err
+	}
+	ptr, free, err := s.writeCString(name)
+	if err != nil {
+		return false, err
+	}
+	defer free()
+	ret, err := s.call(fn, "colorer_load_file_type", uint64(s.ptr), uint64(ptr))
+	if err != nil {
+		return false, err
+	}
+	switch int32(ret[0]) {
+	case -1:
+		return false, fmt.Errorf("colorer: no file type named %q", name)
+	case 0:
+		return false, nil
+	}
+	return true, nil
+}
+
 // wasmRegionSize is sizeof(WasmRegion) in colorer_wrapper.cpp: eight 4-byte
 // fields (int, unsigned int, and a pointer all being 4 bytes on wasm32), with
 // no padding — a static_assert on the C++ side guards this.
