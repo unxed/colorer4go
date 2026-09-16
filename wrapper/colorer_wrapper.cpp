@@ -3,11 +3,69 @@
 #include <colorer/TextParser.h>
 #include <colorer/LineSource.h>
 #include <colorer/handlers/LineRegionsSupport.h>
+#include <colorer/common/Logger.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+// ----------------------------------------------------------------------
+// Diagnostics
+// ----------------------------------------------------------------------
+//
+// Two functions the Go host provides in the "colorer4go" import module.
+// Strings are passed as pointer and length into linear memory and are only
+// valid for the duration of the call.
+extern "C" {
+// One message Colorer reported through its Logger interface.
+__attribute__((import_module("colorer4go"), import_name("log")))
+void colorer4go_host_log(int32_t level, const char* file, int32_t file_len, int32_t line,
+                         const char* func, int32_t func_len, const char* msg, int32_t msg_len);
+// Why the current call is about to abort. Called at most once per call, right
+// before the trap the host then sees as the call's error.
+__attribute__((import_module("colorer4go"), import_name("fatal")))
+void colorer4go_host_fatal(const char* msg, int32_t msg_len);
+}
+
+static int32_t c_len(const char* s) {
+    return s ? static_cast<int32_t>(strlen(s)) : 0;
+}
+
+// Forwards Colorer's own diagnostics — the Logger interface far2l's
+// CerrLogger implements — to the host. Colorer checks getCurrentLogLevel()
+// before it formats a message, so the level set here keeps filtered messages
+// from costing anything.
+class HostLogger final : public Logger {
+public:
+    LogLevel level = LOG_OFF;
+
+    void log(LogLevel lvl, const char* file, int line, const char* func, const char* message) override {
+        colorer4go_host_log(static_cast<int32_t>(lvl), file, c_len(file), line,
+                            func, c_len(func), message, c_len(message));
+    }
+    void flush() override {}
+    LogLevel getCurrentLogLevel() override { return level; }
+};
+
+static HostLogger host_logger;
+
+extern "C" [[noreturn]] void colorer4go_throw_abort(const char* file, int line, const char* func) noexcept {
+    char msg[512];
+    int n = snprintf(msg, sizeof(msg), "C++ exception thrown at %s:%d in %s()",
+                     file ? file : "?", line, func ? func : "?");
+    if (n < 0) {
+        n = 0;
+    } else if (n >= static_cast<int>(sizeof(msg))) {
+        n = sizeof(msg) - 1;
+    }
+    colorer4go_host_fatal(msg, n);
+    abort();
+}
 
 struct WasmRegion {
     int start;
@@ -171,6 +229,23 @@ char* colorer_line_buffer(void* handle, int min_size) {
         session->line_buffer.resize(static_cast<size_t>(min_size));
     }
     return session->line_buffer.data();
+}
+
+// Sets the most verbose Logger level delivered to the host, as Colorer's
+// Logger::LogLevel (0 = off ... 5 = trace). Colorer's logger is a global, so
+// this is per module instance, not per session; call it before colorer_init to
+// see what loading the catalog reports.
+void colorer_set_log_level(int level) {
+    if (level <= Logger::LOG_OFF) {
+        host_logger.level = Logger::LOG_OFF;
+        Log::removeLogger();
+        return;
+    }
+    if (level > Logger::LOG_TRACE) {
+        level = Logger::LOG_TRACE;
+    }
+    host_logger.level = static_cast<Logger::LogLevel>(level);
+    Log::registerLogger(host_logger);
 }
 
 void* colorer_init(const char* catalog_path) {

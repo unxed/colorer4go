@@ -30,8 +30,16 @@ public:
 };
 #define StringIndexOutOfBoundsException DummyStringIndexOutOfBoundsException
 
-// Handles `throw Expr;`, `throw;`, avoids Most Vexing Parse and dangling-else warnings
-#define throw for(int _dummy_throw=0; _dummy_throw<1; _dummy_throw++, ::abort())
+// Defined in colorer_wrapper.cpp. Reports the throw site to the host through
+// the colorer4go.fatal import, then aborts. Exceptions are compiled out, so a
+// throw can only end the call; what the host can still be told is where it
+// happened.
+extern "C" [[noreturn]] void colorer4go_throw_abort(const char* file, int line, const char* func) noexcept;
+
+// Handles `throw Expr;`, `throw;`, avoids Most Vexing Parse and dangling-else warnings.
+// The thrown expression itself is evaluated and discarded: capturing it would
+// need an operand, and the bare `throw;` in Colorer's catch blocks has none.
+#define throw for(int _dummy_throw=0; _dummy_throw<1; _dummy_throw++, ::colorer4go_throw_abort(__FILE__, __LINE__, __func__))
 #define try if(true)
 #define catch(...) for (std::exception e; false; )
 

@@ -1,13 +1,17 @@
 package colorer
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -88,10 +92,296 @@ type Session struct {
 	// linear memory at most once per session no matter how many lines carry
 	// it.
 	nameCache map[uint32]string
+
+	host  *hostState
+	fatal *FatalError
 }
 
-// NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM
-func NewSession(ctx context.Context, catalogPath string, configDirMount string) (*Session, error) {
+// Level is the severity of a Diagnostic. The values are Colorer's own
+// Logger::LogLevel, so the level given to WithDiagnostics is applied inside
+// Colorer, before a filtered message is even formatted.
+type Level int
+
+const (
+	LevelError Level = 1 + iota
+	LevelWarn
+	LevelInfo
+	LevelDebug
+	LevelTrace
+)
+
+func (l Level) String() string {
+	switch l {
+	case LevelError:
+		return "error"
+	case LevelWarn:
+		return "warning"
+	case LevelInfo:
+		return "info"
+	case LevelDebug:
+		return "debug"
+	case LevelTrace:
+		return "trace"
+	}
+	return "level(" + strconv.Itoa(int(l)) + ")"
+}
+
+// Diagnostic is one message Colorer reported through its Logger interface —
+// a malformed XML file, a regular expression in a scheme that does not
+// compile, a region referenced but never defined — or one line the module
+// wrote to its stdout or stderr.
+//
+// Most of what Colorer reports this way is not fatal: it skips the broken part
+// and keeps going, and highlighting is merely incomplete. Without a handler
+// those messages are discarded.
+type Diagnostic struct {
+	Level Level
+	// File and Line locate the Colorer source line that reported the message,
+	// relative to the library tree ("colorer/parsers/HrcLibraryImpl.cpp").
+	// For a line of module output File is "stdout" or "stderr" and Line is 0.
+	File     string
+	Line     int
+	Function string
+	Message  string
+}
+
+func (d Diagnostic) String() string {
+	if d.Line == 0 {
+		return fmt.Sprintf("[%s] %s: %s", d.Level, d.File, d.Message)
+	}
+	return fmt.Sprintf("[%s] %s:%d %s(): %s", d.Level, d.File, d.Line, d.Function, d.Message)
+}
+
+// Option configures NewSession.
+type Option func(*sessionOptions)
+
+type sessionOptions struct {
+	level   Level
+	handler func(Diagnostic)
+}
+
+// WithDiagnostics delivers every message Colorer reports at level or more
+// severe to handler, starting with the ones produced while the catalog loads.
+// The module's stdout and stderr are delivered too, line by line, as LevelInfo
+// and LevelError; without a handler they go to the process's own stdout and
+// stderr, which is where they always went.
+//
+// handler runs synchronously on the goroutine that is calling into the
+// session, from inside that call. It must not call back into the session.
+func WithDiagnostics(level Level, handler func(Diagnostic)) Option {
+	return func(o *sessionOptions) {
+		o.level = level
+		o.handler = handler
+	}
+}
+
+// FatalError reports a call into Colorer that did not return. The module was
+// stopped in the middle of whatever it was doing, so its state is unknown: the
+// session refuses every later call, returning this same error, and the only
+// thing left to do with it is Close.
+//
+// Colorer is compiled without C++ exceptions. Where it throws one — a catalog
+// that does not exist, an HRD scheme name it does not know — it cannot catch
+// it, and the call aborts; Reason then says where the exception was thrown.
+// Colorer's Logger usually explains the circumstances just before that, which
+// is what WithDiagnostics is for.
+type FatalError struct {
+	// Op is the exported wrapper function that failed, e.g. "colorer_set_hrd".
+	Op string
+	// Reason is what the module reported before it stopped: the throw site of
+	// the exception, or else the last line it wrote to stderr during the call.
+	// Empty when it stopped without saying anything.
+	Reason string
+	// Err is the error the WebAssembly runtime returned for the call.
+	Err error
+}
+
+func (e *FatalError) Error() string {
+	var b strings.Builder
+	b.WriteString("colorer: ")
+	b.WriteString(e.Op)
+	b.WriteString(" failed")
+	if e.Reason != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Reason)
+	}
+	if e.Err != nil {
+		// The runtime appends a multi-line wasm stack trace; Unwrap keeps it.
+		msg := e.Err.Error()
+		if i := strings.IndexByte(msg, '\n'); i >= 0 {
+			msg = msg[:i]
+		}
+		b.WriteString(" (")
+		b.WriteString(msg)
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+func (e *FatalError) Unwrap() error { return e.Err }
+
+// hostState is what the functions of the "colorer4go" host module share with
+// the session. It exists before the session does, because the catalog is
+// loaded — and can already fail — inside NewSession.
+type hostState struct {
+	opts sessionOptions
+
+	// Collected during one call into the module, reset before the next.
+	fatalReason string
+	lastStderr  string
+}
+
+func (h *hostState) deliver(d Diagnostic) {
+	if h.opts.handler != nil && d.Level <= h.opts.level {
+		h.opts.handler(d)
+	}
+}
+
+func (h *hostState) beginCall() {
+	h.fatalReason = ""
+	h.lastStderr = ""
+}
+
+func (h *hostState) reason() string {
+	if h.fatalReason != "" {
+		return h.fatalReason
+	}
+	if h.lastStderr != "" {
+		return "stderr: " + h.lastStderr
+	}
+	return ""
+}
+
+// callFn runs one exported function and turns a failed call into a
+// FatalError. Every call into the module goes through here or through
+// Session.call, so none of them can fail without saying why.
+func callFn(ctx context.Context, h *hostState, fn api.Function, op string, params ...uint64) ([]uint64, error) {
+	if fn == nil {
+		return nil, fmt.Errorf("%s is not exported by the embedded colorer.wasm; rebuild it with ./build_wasm.sh", op)
+	}
+	h.beginCall()
+	res, err := fn.Call(ctx, params...)
+	if err != nil {
+		return nil, &FatalError{Op: op, Reason: h.reason(), Err: err}
+	}
+	return res, nil
+}
+
+// call is callFn for a live session: it refuses to run once a call has
+// failed, and remembers the first failure.
+func (s *Session) call(fn api.Function, op string, params ...uint64) ([]uint64, error) {
+	if s.fatal != nil {
+		return nil, s.fatal
+	}
+	res, err := callFn(s.ctx, s.host, fn, op, params...)
+	var fe *FatalError
+	if errors.As(err, &fe) {
+		s.fatal = fe
+	}
+	return res, err
+}
+
+// Err returns the FatalError that made the session unusable, or nil while it
+// is still usable.
+func (s *Session) Err() error {
+	if s.fatal == nil {
+		return nil
+	}
+	return s.fatal
+}
+
+// streamWriter splits one of the module's output streams into lines for the
+// diagnostics handler, and remembers the last stderr line so that a call
+// which then aborts can say what was printed. Without a handler the bytes
+// still go where they always went.
+type streamWriter struct {
+	host  *hostState
+	name  string
+	level Level
+	out   io.Writer
+	buf   []byte
+}
+
+func (w *streamWriter) Write(p []byte) (int, error) {
+	if w.host.opts.handler == nil && w.out != nil {
+		if _, err := w.out.Write(p); err != nil {
+			return 0, err
+		}
+	}
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		w.emit(string(bytes.TrimRight(w.buf[:i], "\r")))
+		w.buf = w.buf[i+1:]
+	}
+	if w.name == "stderr" && len(w.buf) > 0 {
+		// An abort message need not end in a newline; keep what there is.
+		w.host.lastStderr = string(w.buf)
+	}
+	return len(p), nil
+}
+
+func (w *streamWriter) emit(line string) {
+	if line == "" {
+		return
+	}
+	if w.name == "stderr" {
+		w.host.lastStderr = line
+	}
+	w.host.deliver(Diagnostic{Level: w.level, File: w.name, Message: line})
+}
+
+// readGuestString copies a pointer-and-length string out of linear memory.
+func readGuestString(mod api.Module, ptr, length uint32) string {
+	if length == 0 {
+		return ""
+	}
+	b, ok := mod.Memory().Read(ptr, length)
+	if !ok {
+		return ""
+	}
+	return string(b)
+}
+
+// instantiateHostModule provides the "colorer4go" imports the wrapper uses to
+// report diagnostics (colorer_wrapper.cpp, HostLogger and
+// colorer4go_throw_abort).
+func instantiateHostModule(ctx context.Context, r wazero.Runtime, h *hostState) error {
+	i32 := api.ValueTypeI32
+	_, err := r.NewHostModuleBuilder("colorer4go").
+		NewFunctionBuilder().
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
+			h.deliver(Diagnostic{
+				Level:    Level(int32(stack[0])),
+				File:     readGuestString(mod, uint32(stack[1]), uint32(stack[2])),
+				Line:     int(int32(stack[3])),
+				Function: readGuestString(mod, uint32(stack[4]), uint32(stack[5])),
+				Message:  readGuestString(mod, uint32(stack[6]), uint32(stack[7])),
+			})
+		}), []api.ValueType{i32, i32, i32, i32, i32, i32, i32, i32}, nil).
+		Export("log").
+		NewFunctionBuilder().
+		WithGoModuleFunction(api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
+			h.fatalReason = readGuestString(mod, uint32(stack[0]), uint32(stack[1]))
+		}), []api.ValueType{i32, i32}, nil).
+		Export("fatal").
+		Instantiate(ctx)
+	return err
+}
+
+// NewSession instantiates Colorer and mounts the host configDirMount folder inside WASM.
+//
+// A catalog Colorer cannot load makes it return a *FatalError; see
+// WithDiagnostics for how to learn more about why.
+func NewSession(ctx context.Context, catalogPath string, configDirMount string, opts ...Option) (*Session, error) {
+	host := &hostState{}
+	for _, opt := range opts {
+		opt(&host.opts)
+	}
+
 	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().
 		WithCompilationCache(sharedCompilationCache()))
 
@@ -119,13 +409,18 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 		r.Close(ctx)
 		return nil, err
 	}
+	if err = instantiateHostModule(ctx, r, host); err != nil {
+		r.Close(ctx)
+		return nil, err
+	}
 
-	// Mount the host config directory containing XML schemas to the WASM root "/"
-	// Redirect Stderr/Stdout to host console to intercept C++ error prints
+	// Mount the host config directory containing XML schemas to the WASM root "/".
+	// The module's stdout and stderr go to the diagnostics handler when there
+	// is one, and to the process's own streams otherwise.
 	config := wazero.NewModuleConfig().
 		WithFSConfig(wazero.NewFSConfig().WithDirMount(configDirMount, "/")).
-		WithStdout(os.Stdout).
-		WithStderr(os.Stderr)
+		WithStdout(&streamWriter{host: host, name: "stdout", level: LevelInfo, out: os.Stdout}).
+		WithStderr(&streamWriter{host: host, name: "stderr", level: LevelError, out: os.Stderr})
 
 	mod, err := r.InstantiateModule(ctx, compiled, config)
 	if err != nil {
@@ -136,7 +431,14 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 	// Initialize the WASI Reactor runtime to deploy C++ global constructors
 	initWasiFn := mod.ExportedFunction("_initialize")
 	if initWasiFn != nil {
-		if _, err := initWasiFn.Call(ctx); err != nil {
+		if _, err := callFn(ctx, host, initWasiFn, "_initialize"); err != nil {
+			r.Close(ctx)
+			return nil, err
+		}
+	}
+
+	if host.opts.handler != nil {
+		if _, err := callFn(ctx, host, mod.ExportedFunction("colorer_set_log_level"), "colorer_set_log_level", uint64(host.opts.level)); err != nil {
 			r.Close(ctx)
 			return nil, err
 		}
@@ -152,30 +454,32 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 	// Copy the catalog path string to WASM memory
 	pathBytes := []byte(catalogPath)
 	pathLen := uint64(len(pathBytes) + 1)
-	res, err := allocFn.Call(ctx, pathLen)
+	res, err := callFn(ctx, host, allocFn, "colorer_alloc", pathLen)
 	if err != nil {
 		r.Close(ctx)
 		return nil, err
 	}
 	pathPtr := uint32(res[0])
-	defer mod.ExportedFunction("colorer_free").Call(ctx, uint64(pathPtr))
-
 	mod.Memory().Write(pathPtr, append(pathBytes, 0))
 
-	res, err = initFn.Call(ctx, uint64(pathPtr))
-	if err != nil || res[0] == 0 {
+	res, err = callFn(ctx, host, initFn, "colorer_init", uint64(pathPtr))
+	if err != nil {
+		// The module is not usable after a failed call, not even to free.
 		r.Close(ctx)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
+	}
+	_, _ = callFn(ctx, host, mod.ExportedFunction("colorer_free"), "colorer_free", uint64(pathPtr))
+	if res[0] == 0 {
+		r.Close(ctx)
 		return nil, errors.New("colorer_init returned null pointer")
 	}
 
 	s := &Session{
-		ctx: ctx,
-		r:   r,
-		mod: mod,
-		ptr: uint32(res[0]),
+		ctx:  ctx,
+		r:    r,
+		mod:  mod,
+		ptr:  uint32(res[0]),
+		host: host,
 	}
 	s.lineBufferFn = mod.ExportedFunction("colorer_line_buffer")
 	s.parseLineFn = mod.ExportedFunction("colorer_parse_line")
@@ -184,68 +488,77 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string) 
 }
 
 func (s *Session) Close() {
-	if s.mod != nil {
-		s.mod.ExportedFunction("colorer_destroy").Call(s.ctx, uint64(s.ptr))
+	// After a failed call the module's heap is in whatever state the abort
+	// left it; closing the runtime releases it all without running into it.
+	if s.mod != nil && s.fatal == nil {
+		s.call(s.mod.ExportedFunction("colorer_destroy"), "colorer_destroy", uint64(s.ptr))
 	}
 	s.r.Close(s.ctx)
 }
 
+// writeCString copies str into memory the module allocates, NUL-terminated,
+// and returns a function that frees it again.
+func (s *Session) writeCString(str string) (uint32, func(), error) {
+	b := append([]byte(str), 0)
+	res, err := s.call(s.mod.ExportedFunction("colorer_alloc"), "colorer_alloc", uint64(len(b)))
+	if err != nil {
+		return 0, func() {}, err
+	}
+	ptr := uint32(res[0])
+	s.mod.Memory().Write(ptr, b)
+	return ptr, func() {
+		s.call(s.mod.ExportedFunction("colorer_free"), "colorer_free", uint64(ptr))
+	}, nil
+}
+
 func (s *Session) SetHRD(hrdClass, hrdName string) error {
-	allocFn := s.mod.ExportedFunction("colorer_alloc")
-	freeFn := s.mod.ExportedFunction("colorer_free")
-	setHrdFn := s.mod.ExportedFunction("colorer_set_hrd")
-
-	cBytes := append([]byte(hrdClass), 0)
-	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	cPtr, freeC, err := s.writeCString(hrdClass)
 	if err != nil {
 		return err
 	}
-	cPtr := uint32(cRes[0])
-	defer freeFn.Call(s.ctx, uint64(cPtr))
-	s.mod.Memory().Write(cPtr, cBytes)
-
-	nBytes := append([]byte(hrdName), 0)
-	nRes, err := allocFn.Call(s.ctx, uint64(len(nBytes)))
+	defer freeC()
+	nPtr, freeN, err := s.writeCString(hrdName)
 	if err != nil {
 		return err
 	}
-	nPtr := uint32(nRes[0])
-	defer freeFn.Call(s.ctx, uint64(nPtr))
-	s.mod.Memory().Write(nPtr, nBytes)
+	defer freeN()
 
-	ret, err := setHrdFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr), uint64(nPtr))
-	if err != nil || ret[0] == 0 {
+	ret, err := s.call(s.mod.ExportedFunction("colorer_set_hrd"), "colorer_set_hrd", uint64(s.ptr), uint64(cPtr), uint64(nPtr))
+	if err != nil {
+		return err
+	}
+	if ret[0] == 0 {
 		return errors.New("colorer_set_hrd failed")
 	}
 	return nil
 }
 
 func (s *Session) EnumHRDInstances(classID string) ([]HRDInstance, error) {
-	allocFn := s.mod.ExportedFunction("colorer_alloc")
-	freeFn := s.mod.ExportedFunction("colorer_free")
-	enumFn := s.mod.ExportedFunction("colorer_enum_hrd_instances")
 	getNameFn := s.mod.ExportedFunction("colorer_get_hrd_name")
 	getDescFn := s.mod.ExportedFunction("colorer_get_hrd_description")
 
-	cBytes := append([]byte(classID), 0)
-	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	cPtr, freeC, err := s.writeCString(classID)
 	if err != nil {
 		return nil, err
 	}
-	cPtr := uint32(cRes[0])
-	defer freeFn.Call(s.ctx, uint64(cPtr))
-	s.mod.Memory().Write(cPtr, cBytes)
+	defer freeC()
 
-	ret, err := enumFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr))
+	ret, err := s.call(s.mod.ExportedFunction("colorer_enum_hrd_instances"), "colorer_enum_hrd_instances", uint64(s.ptr), uint64(cPtr))
 	if err != nil {
 		return nil, err
 	}
 	count := int(ret[0])
 	var instances []HRDInstance
 	for i := 0; i < count; i++ {
-		namePtr, _ := getNameFn.Call(s.ctx, uint64(s.ptr), uint64(i))
+		namePtr, err := s.call(getNameFn, "colorer_get_hrd_name", uint64(s.ptr), uint64(i))
+		if err != nil {
+			return nil, err
+		}
 		nameStr, _ := readString(s.mod.Memory(), uint32(namePtr[0]))
-		descPtr, _ := getDescFn.Call(s.ctx, uint64(s.ptr), uint64(i))
+		descPtr, err := s.call(getDescFn, "colorer_get_hrd_description", uint64(s.ptr), uint64(i))
+		if err != nil {
+			return nil, err
+		}
 		descStr, _ := readString(s.mod.Memory(), uint32(descPtr[0]))
 		instances = append(instances, HRDInstance{Name: nameStr, Description: descStr})
 	}
@@ -253,20 +566,13 @@ func (s *Session) EnumHRDInstances(classID string) ([]HRDInstance, error) {
 }
 
 func (s *Session) GetRegionDefine(name string) (*RegionDefine, error) {
-	allocFn := s.mod.ExportedFunction("colorer_alloc")
-	freeFn := s.mod.ExportedFunction("colorer_free")
-	getRdFn := s.mod.ExportedFunction("colorer_get_region_define")
-
-	cBytes := append([]byte(name), 0)
-	cRes, err := allocFn.Call(s.ctx, uint64(len(cBytes)))
+	cPtr, freeC, err := s.writeCString(name)
 	if err != nil {
 		return nil, err
 	}
-	cPtr := uint32(cRes[0])
-	defer freeFn.Call(s.ctx, uint64(cPtr))
-	s.mod.Memory().Write(cPtr, cBytes)
+	defer freeC()
 
-	resPtrBlock, err := allocFn.Call(s.ctx, 20)
+	resPtrBlock, err := s.call(s.mod.ExportedFunction("colorer_alloc"), "colorer_alloc", 20)
 	if err != nil {
 		return nil, err
 	}
@@ -275,10 +581,13 @@ func (s *Session) GetRegionDefine(name string) (*RegionDefine, error) {
 	pStyle := pFore + 8
 	pIsForeSet := pFore + 12
 	pIsBackSet := pFore + 16
-	defer freeFn.Call(s.ctx, uint64(pFore))
+	defer s.call(s.mod.ExportedFunction("colorer_free"), "colorer_free", uint64(pFore))
 
-	ret, err := getRdFn.Call(s.ctx, uint64(s.ptr), uint64(cPtr), uint64(pFore), uint64(pBack), uint64(pStyle), uint64(pIsForeSet), uint64(pIsBackSet))
-	if err != nil || ret[0] == 0 {
+	ret, err := s.call(s.mod.ExportedFunction("colorer_get_region_define"), "colorer_get_region_define", uint64(s.ptr), uint64(cPtr), uint64(pFore), uint64(pBack), uint64(pStyle), uint64(pIsForeSet), uint64(pIsBackSet))
+	if err != nil {
+		return nil, err
+	}
+	if ret[0] == 0 {
 		return nil, errors.New("region not found")
 	}
 
@@ -298,29 +607,18 @@ func (s *Session) GetRegionDefine(name string) (*RegionDefine, error) {
 }
 
 func (s *Session) SelectType(fileName, firstLine string) (bool, error) {
-	allocFn := s.mod.ExportedFunction("colorer_alloc")
-	freeFn := s.mod.ExportedFunction("colorer_free")
-	selectFn := s.mod.ExportedFunction("colorer_select_type")
-
-	fnBytes := append([]byte(fileName), 0)
-	res, err := allocFn.Call(s.ctx, uint64(len(fnBytes)))
+	fnPtr, freeFn, err := s.writeCString(fileName)
 	if err != nil {
 		return false, err
 	}
-	fnPtr := uint32(res[0])
-	defer freeFn.Call(s.ctx, uint64(fnPtr))
-	s.mod.Memory().Write(fnPtr, fnBytes)
-
-	flBytes := append([]byte(firstLine), 0)
-	res, err = allocFn.Call(s.ctx, uint64(len(flBytes)))
+	defer freeFn()
+	flPtr, freeFl, err := s.writeCString(firstLine)
 	if err != nil {
 		return false, err
 	}
-	flPtr := uint32(res[0])
-	defer freeFn.Call(s.ctx, uint64(flPtr))
-	s.mod.Memory().Write(flPtr, flBytes)
+	defer freeFl()
 
-	ret, err := selectFn.Call(s.ctx, uint64(s.ptr), uint64(fnPtr), uint64(flPtr))
+	ret, err := s.call(s.mod.ExportedFunction("colorer_select_type"), "colorer_select_type", uint64(s.ptr), uint64(fnPtr), uint64(flPtr))
 	if err != nil {
 		return false, err
 	}
@@ -338,7 +636,7 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 	}
 
 	lineBytes := []byte(line)
-	res, err := s.lineBufferFn.Call(s.ctx, uint64(s.ptr), uint64(len(lineBytes)))
+	res, err := s.call(s.lineBufferFn, "colorer_line_buffer", uint64(s.ptr), uint64(len(lineBytes)))
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +648,7 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 		s.mod.Memory().Write(linePtr, lineBytes)
 	}
 
-	ret, err := s.parseLineFn.Call(s.ctx, uint64(s.ptr), uint64(linePtr), uint64(len(lineBytes)))
+	ret, err := s.call(s.parseLineFn, "colorer_parse_line", uint64(s.ptr), uint64(linePtr), uint64(len(lineBytes)))
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +664,7 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 	if s.getRegionsFn == nil {
 		return nil, errors.New("colorer_get_regions is not exported by the embedded colorer.wasm; rebuild it with ./build_wasm.sh")
 	}
-	ptrRes, err := s.getRegionsFn.Call(s.ctx, uint64(s.ptr))
+	ptrRes, err := s.call(s.getRegionsFn, "colorer_get_regions", uint64(s.ptr))
 	if err != nil {
 		return nil, err
 	}
@@ -406,8 +704,9 @@ func (s *Session) ParseLine(line string) ([]Region, error) {
 	return regions, nil
 }
 
+// Reset is a no-op on a session that has failed; see Err.
 func (s *Session) Reset() {
-	s.mod.ExportedFunction("colorer_reset_session").Call(s.ctx, uint64(s.ptr))
+	s.call(s.mod.ExportedFunction("colorer_reset_session"), "colorer_reset_session", uint64(s.ptr))
 }
 
 // exportedFn looks a function up in the module and says what to do when the
@@ -443,7 +742,7 @@ func (s *Session) ForgetBefore(line int) error {
 	if line < 0 {
 		line = 0
 	}
-	_, err = fn.Call(s.ctx, uint64(s.ptr), uint64(uint32(line)))
+	_, err = s.call(fn, "colorer_forget_before", uint64(s.ptr), uint64(uint32(line)))
 	return err
 }
 
@@ -464,7 +763,7 @@ func (s *Session) lineBound(name string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	res, err := fn.Call(s.ctx, uint64(s.ptr))
+	res, err := s.call(fn, name, uint64(s.ptr))
 	if err != nil {
 		return 0, err
 	}

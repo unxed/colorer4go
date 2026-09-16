@@ -8,11 +8,17 @@ project(ColorerWasm C CXX)
 
 # Disable C++ exceptions and preserve RTTI for dynamic_cast support.
 # wasm_compat.h provides WASM-specific compatibility definitions.
+#
+# The prefix maps make __FILE__ relative: Colorer's log messages and the throw
+# sites reported to the host read colorer/parsers/HrcLibraryImpl.cpp rather
+# than the absolute path of whatever machine built the module.
 add_compile_options(
     -fno-exceptions
     -frtti
     -D__EMSCRIPTEN__
     -include ${CMAKE_CURRENT_SOURCE_DIR}/wrapper/wasm_compat.h
+    -fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/colorer/src/Colorer-library/src/=
+    -fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=
 )
 
 # ----------------------------------------------------------------------
@@ -125,6 +131,7 @@ target_link_options(
         "-Wl,--export=colorer_alloc"
         "-Wl,--export=colorer_free"
         "-Wl,--export=colorer_line_buffer"
+        "-Wl,--export=colorer_set_log_level"
         "-Wl,--export=colorer_init"
         "-Wl,--export=colorer_destroy"
         "-Wl,--export=colorer_reset_session"

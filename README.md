@@ -32,10 +32,11 @@ A stateful syntax highlighting session. Since Colorer maintains state (caches) a
 #### `func NewSession`
 Instantiates a new Colorer WASM environment and loads the catalog rules.
 ```go
-func NewSession(ctx context.Context, catalogPath string, configDirMount string) (*Session, error)
+func NewSession(ctx context.Context, catalogPath string, configDirMount string, opts ...Option) (*Session, error)
 ```
 * `catalogPath`: Path to the `catalog.xml` file inside the WASM virtual filesystem (e.g., `"/base/catalog.xml"`).
 * `configDirMount`: The path on the host machine containing the Colorer configurations (e.g., `"colorer/configs"`). It will be mounted as the root `/` inside the WASM sandbox.
+* `opts`: optional; see [Diagnostics](#diagnostics).
 
 #### `func (*Session) SelectType`
 Selects the syntax highlighting scheme (HRC type) based on the file name and/or the first line of the file.
@@ -83,6 +84,68 @@ func (s *Session) Reset()
 Closes the session, deallocates C++ memory, and shuts down the wazero runtime. Always use `defer session.Close()` after creation.
 ```go
 func (s *Session) Close()
+```
+
+---
+
+### Diagnostics
+
+Colorer reports what it finds wrong with the configuration through its own
+`Logger` interface: XML that does not parse (with file and line), a regular
+expression in a scheme that does not compile, a region that is referenced but
+never defined. Most of these are not fatal — Colorer skips the broken part and
+highlighting is merely incomplete — which is exactly why they are easy to miss.
+Without a handler they are discarded.
+
+```go
+func WithDiagnostics(level Level, handler func(Diagnostic)) Option
+```
+
+Delivers every message at `level` or more severe (`LevelError`, `LevelWarn`,
+`LevelInfo`, `LevelDebug`, `LevelTrace` — Colorer's own levels, filtered inside
+Colorer), starting with the ones produced while the catalog loads. The module's
+stdout and stderr are delivered too, line by line. The handler runs on the
+goroutine calling into the session, from inside that call, and must not call
+back into the session. The stock catalog produces nothing at `LevelWarn`.
+
+```go
+type Diagnostic struct {
+	Level    Level
+	File     string // "colorer/parsers/HrcLibraryImpl.cpp", or "stdout"/"stderr"
+	Line     int
+	Function string
+	Message  string
+}
+```
+
+#### `type FatalError`
+
+Colorer is compiled without C++ exceptions (the WASI build cannot unwind), so
+wherever it throws one — a catalog that does not exist, an HRC file that is not
+well-formed, an HRD scheme name it does not know — the call aborts. The call
+then returns a `*FatalError`:
+
+```go
+type FatalError struct {
+	Op     string // the wrapper function that failed, e.g. "colorer_set_hrd"
+	Reason string // "C++ exception thrown at colorer/parsers/ParserFactoryImpl.cpp:271 in getHrdNode()"
+	Err    error  // the runtime's error, with the wasm stack trace
+}
+```
+
+The exception's own message cannot be recovered, only its throw site; the
+diagnostics delivered just before it usually say the rest (for a broken HRC
+file, libxml2's error with the file name and line).
+
+The module's state after an aborted call is unknown, so the session refuses
+every later call and returns the same error. `Session.Err()` reports it; the
+only thing left to do with such a session is `Close`.
+
+```go
+session, err := colorer.NewSession(ctx, "/base/catalog.xml", dir,
+	colorer.WithDiagnostics(colorer.LevelWarn, func(d colorer.Diagnostic) {
+		log.Printf("colorer: %s", d)
+	}))
 ```
 
 ---
