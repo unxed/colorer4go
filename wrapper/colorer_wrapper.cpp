@@ -322,6 +322,12 @@ struct ColorerSession {
     std::vector<FileType*> type_cache;
     std::string last_type_str;
 
+    // The type the parser was given last, by colorer_select_type or
+    // colorer_set_file_type; TextParser does not say.
+    FileType* current_type = nullptr;
+    std::string current_type_name;
+    std::string last_param;
+
     // Reused across colorer_parse_line calls so a session that has already
     // seen a line at least this long does not pay for a malloc/free pair on
     // every subsequent one. Only grows: parse_line copies the bytes into a
@@ -413,6 +419,19 @@ int colorer_load_user_hrc(void* handle, const char* path) {
     return 1;
 }
 
+// HRC settings, as FarColorer's readSystemHrcSettings loads
+// plug/hrcsettings.xml: an <hrc-settings> file whose prototypes give file types
+// parameters and their defaults — hotkey, favorite, show-cross and the rest.
+// FarColorer loads them after the catalog and before the user's styles.
+// Returns 0 for a bad handle.
+int colorer_load_hrc_settings(void* handle, const char* path) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !path) return 0;
+    UnicodeString location(path);
+    session->factory->loadHrcSettings(&location, false);
+    return 1;
+}
+
 void colorer_destroy(void* handle) {
     if (handle) {
         delete static_cast<ColorerSession*>(handle);
@@ -496,6 +515,75 @@ int colorer_select_type(void* handle, const char* file_name, const char* first_l
     if (!type) return 0;
     session->factory->getHrcLibrary().loadFileType(type);
     session->parser->setFileType(type);
+    session->current_type = type;
+    return 1;
+}
+
+static UnicodeString utf8(const char* s) {
+    return UnicodeString(s, static_cast<int32_t>(strlen(s)), Encodings::ENC_UTF8);
+}
+
+// Gives the parser the named type instead of choosing one by file name, as
+// FarColorer's list of types does. Returns 0 when no type has the name.
+int colorer_set_file_type(void* handle, const char* name) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !name) return 0;
+    UnicodeString type_name = utf8(name);
+    auto& library = session->factory->getHrcLibrary();
+    FileType* type = library.getFileType(&type_name);
+    if (!type) return 0;
+    library.loadFileType(type);
+    session->parser->setFileType(type);
+    session->current_type = type;
+    return 1;
+}
+
+// The name of the type the parser has, or "" before one is set.
+const char* colorer_file_type(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return nullptr;
+    session->current_type_name.clear();
+    if (session->current_type) {
+        session->current_type_name = session->current_type->getName().getChars(Encodings::ENC_UTF8);
+    }
+    return session->current_type_name.c_str();
+}
+
+// A parameter's value for a type, the user's value if there is one, as UTF-8;
+// nullptr when the type or the parameter does not exist.
+const char* colorer_get_file_type_param(void* handle, const char* type_name, const char* param) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !type_name || !param) return nullptr;
+    UnicodeString name = utf8(type_name);
+    FileType* type = session->factory->getHrcLibrary().getFileType(&name);
+    if (!type) return nullptr;
+    const UnicodeString* value = type->getParamValue(utf8(param));
+    if (!value) return nullptr;
+    session->last_param = value->getChars(Encodings::ENC_UTF8);
+    return session->last_param.c_str();
+}
+
+// FarEditorSet::addParamAndValue: sets the user's value of a type's parameter,
+// first adding the parameter with the "default" type's value when the type
+// lacks it. Returns 1, 0 when the type does not exist, -1 when neither the type
+// nor "default" has the parameter.
+int colorer_set_file_type_param(void* handle, const char* type_name, const char* param, const char* value) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !type_name || !param || !value) return 0;
+    auto& library = session->factory->getHrcLibrary();
+    UnicodeString name = utf8(type_name);
+    FileType* type = library.getFileType(&name);
+    if (!type) return 0;
+    UnicodeString param_name = utf8(param);
+    if (type->getParamValue(param_name) == nullptr) {
+        UnicodeString default_name("default");
+        FileType* def = library.getFileType(&default_name);
+        const UnicodeString* default_value = def ? def->getParamValue(param_name) : nullptr;
+        if (!default_value) return -1;
+        type->addParam(param_name, *default_value);
+    }
+    UnicodeString param_value = utf8(value);
+    type->setParamValue(param_name, &param_value);
     return 1;
 }
 

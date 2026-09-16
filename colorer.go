@@ -288,8 +288,9 @@ type sessionOptions struct {
 	level   Level
 	handler func(Diagnostic)
 
-	userHRD string
-	userHRC string
+	userHRD     string
+	userHRC     string
+	hrcSettings string
 }
 
 // WithDiagnostics delivers every message Colorer reports at level or more
@@ -355,11 +356,25 @@ func WithUserHRC(path string) Option {
 	}
 }
 
+// WithHRCSettings loads an <hrc-settings> file after the catalog and before
+// the user's styles and schemes, the way FarColorer loads
+// plug/hrcsettings.xml: its prototypes give file types parameters with
+// defaults — hotkey, favorite, show-cross, maxlinelength and the rest — which
+// FileTypeParam reads and SetFileTypeParam sets. path is a host path to the
+// file; a folder is not accepted. Missing paths and file names are handled as
+// in WithUserHRD.
+func WithHRCSettings(path string) Option {
+	return func(o *sessionOptions) {
+		o.hrcSettings = path
+	}
+}
+
 // Where the user's own files are mounted inside the module. The configuration
 // directory is the root, so these names only have to be ones no catalog uses.
 const (
-	userHRDGuestDir = "/.colorer4go/user-hrd"
-	userHRCGuestDir = "/.colorer4go/user-hrc"
+	hrcSettingsGuestDir = "/.colorer4go/hrc-settings"
+	userHRDGuestDir     = "/.colorer4go/user-hrd"
+	userHRCGuestDir     = "/.colorer4go/user-hrc"
 )
 
 // userLoad is one user path to hand to Colorer once the catalog is loaded.
@@ -371,6 +386,8 @@ type userLoad struct {
 	// loads tells which files of a folder Colorer opens, as
 	// ParserFactory::Impl::loadHrdPath and loadHrcPath select them.
 	loads func(name string) bool
+	// fileOnly refuses a folder: HRC settings are one file.
+	fileOnly bool
 }
 
 func loadsHRD(name string) bool { return strings.HasSuffix(name, ".hrd") }
@@ -663,6 +680,7 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 	fsConfig := wazero.NewFSConfig().WithDirMount(configDirMount, "/")
 	var userLoads []userLoad
 	for _, u := range []userLoad{
+		{op: "colorer_load_hrc_settings", what: "HRC settings", hostPath: host.opts.hrcSettings, guestPath: hrcSettingsGuestDir, loads: func(string) bool { return false }, fileOnly: true},
 		{op: "colorer_load_user_hrd", what: "user colour styles", hostPath: host.opts.userHRD, guestPath: userHRDGuestDir, loads: loadsHRD},
 		{op: "colorer_load_user_hrc", what: "user schemes", hostPath: host.opts.userHRC, guestPath: userHRCGuestDir, loads: loadsHRC},
 	} {
@@ -670,6 +688,9 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 			continue
 		}
 		hostDir, guestPath, mErr := userMount(u.hostPath, u.guestPath, u.loads)
+		if mErr == nil && u.fileOnly && guestPath == u.guestPath {
+			mErr = fmt.Errorf("%q is a folder, not a file", u.hostPath)
+		}
 		if mErr != nil {
 			host.deliver(Diagnostic{Level: LevelWarn, File: "colorer4go", Message: fmt.Sprintf("%s not loaded: %v", u.what, mErr)})
 			continue
@@ -986,6 +1007,100 @@ func (s *Session) LoadFileType(name string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// SetFileType gives the parser the named type instead of choosing one by file
+// name, as FarColorer's list of types does. It reports false when no type has
+// the name. A scheme Colorer cannot parse is a *FatalError, as in SelectType.
+func (s *Session) SetFileType(name string) (bool, error) {
+	fn, err := s.exportedFn("colorer_set_file_type")
+	if err != nil {
+		return false, err
+	}
+	ptr, free, err := s.writeCString(name)
+	if err != nil {
+		return false, err
+	}
+	defer free()
+	ret, err := s.call(fn, "colorer_set_file_type", uint64(s.ptr), uint64(ptr))
+	if err != nil {
+		return false, err
+	}
+	return ret[0] != 0, nil
+}
+
+// FileType is the name of the type the parser has — the one SelectType chose
+// or SetFileType set — or "" before either.
+func (s *Session) FileType() (string, error) {
+	fn, err := s.exportedFn("colorer_file_type")
+	if err != nil {
+		return "", err
+	}
+	ret, err := s.call(fn, "colorer_file_type", uint64(s.ptr))
+	if err != nil {
+		return "", err
+	}
+	if ret[0] == 0 {
+		return "", nil
+	}
+	return readString(s.mod.Memory(), uint32(ret[0]))
+}
+
+// FileTypeParam is a type's parameter — the user's value if one was set,
+// otherwise its default. ok is false when the type or the parameter does not
+// exist; parameters come from HRC files and WithHRCSettings.
+func (s *Session) FileTypeParam(typeName, param string) (value string, ok bool, err error) {
+	fn, err := s.exportedFn("colorer_get_file_type_param")
+	if err != nil {
+		return "", false, err
+	}
+	tPtr, freeT, err := s.writeCString(typeName)
+	if err != nil {
+		return "", false, err
+	}
+	defer freeT()
+	pPtr, freeP, err := s.writeCString(param)
+	if err != nil {
+		return "", false, err
+	}
+	defer freeP()
+	ret, err := s.call(fn, "colorer_get_file_type_param", uint64(s.ptr), uint64(tPtr), uint64(pPtr))
+	if err != nil || ret[0] == 0 {
+		return "", false, err
+	}
+	value, err = readString(s.mod.Memory(), uint32(ret[0]))
+	return value, err == nil, err
+}
+
+// SetFileTypeParam sets the user's value of a type's parameter, as
+// FarEditorSet::addParamAndValue does: a parameter the type lacks is first
+// added with the "default" type's value. It is an error when the type does not
+// exist, or when neither it nor "default" has the parameter.
+func (s *Session) SetFileTypeParam(typeName, param, value string) error {
+	fn, err := s.exportedFn("colorer_set_file_type_param")
+	if err != nil {
+		return err
+	}
+	var ptrs [3]uint32
+	for i, str := range []string{typeName, param, value} {
+		ptr, free, err := s.writeCString(str)
+		if err != nil {
+			return err
+		}
+		defer free()
+		ptrs[i] = ptr
+	}
+	ret, err := s.call(fn, "colorer_set_file_type_param", uint64(s.ptr), uint64(ptrs[0]), uint64(ptrs[1]), uint64(ptrs[2]))
+	if err != nil {
+		return err
+	}
+	switch int32(ret[0]) {
+	case 0:
+		return fmt.Errorf("colorer: no file type named %q", typeName)
+	case -1:
+		return fmt.Errorf("colorer: neither %q nor \"default\" has a parameter %q", typeName, param)
+	}
+	return nil
 }
 
 // wasmRegionSize is sizeof(WasmRegion) in colorer_wrapper.cpp: eight 4-byte

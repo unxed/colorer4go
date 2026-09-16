@@ -104,6 +104,22 @@ func (s *Session) ParseLine(line string) ([]Region, error)
 * `line`: A single line of UTF-8 encoded text.
 * Returns a slice of `Region` tokens.
 
+#### Choosing a type and its parameters
+```go
+func WithHRCSettings(path string) Option
+func (s *Session) SetFileType(name string) (bool, error)
+func (s *Session) FileType() (string, error)
+func (s *Session) FileTypeParam(typeName, param string) (string, bool, error)
+func (s *Session) SetFileTypeParam(typeName, param, value string) error
+```
+`SetFileType` gives the parser a type by name instead of choosing one by file
+name; `FileType` says which type it has. File types carry parameters —
+`hotkey`, `favorite`, `show-cross` and the rest — whose defaults come from an
+`<hrc-settings>` file such as far2l's `plug/hrcsettings.xml`, loaded with
+`WithHRCSettings`. `SetFileTypeParam` sets a user value as
+`FarEditorSet::addParamAndValue` does, adding a parameter the type lacks with
+the `default` type's value.
+
 #### `func (*Session) ParseLinePairs`
 `ParseLine` that also returns the line's paired tokens — brackets, `begin`/`end`
 and the like, the regions under `def:PairStart` and `def:PairEnd`.
