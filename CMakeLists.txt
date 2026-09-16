@@ -133,6 +133,8 @@ target_link_options(
         "-Wl,--export=colorer_line_buffer"
         "-Wl,--export=colorer_set_log_level"
         "-Wl,--export=colorer_init"
+        "-Wl,--export=colorer_load_user_hrd"
+        "-Wl,--export=colorer_load_user_hrc"
         "-Wl,--export=colorer_destroy"
         "-Wl,--export=colorer_reset_session"
         "-Wl,--export=colorer_set_hrd"

@@ -12,6 +12,8 @@ __attribute__((used)) void colorer_free(void* ptr);
 __attribute__((used)) char* colorer_line_buffer(void* handle, int min_size);
 __attribute__((used)) void colorer_set_log_level(int level);
 __attribute__((used)) void* colorer_init(const char* catalog_path);
+__attribute__((used)) int colorer_load_user_hrd(void* handle, const char* path);
+__attribute__((used)) int colorer_load_user_hrc(void* handle, const char* path);
 __attribute__((used)) void colorer_destroy(void* handle);
 __attribute__((used)) void colorer_reset_session(void* handle);
 __attribute__((used)) int colorer_set_hrd(void* handle, const char* hrd_class, const char* hrd_name);

@@ -261,6 +261,30 @@ void* colorer_init(const char* catalog_path) {
     return session;
 }
 
+// The user's own colour styles, loaded on top of the catalog: an XML file in
+// the catalog's <hrd-sets> format, or a folder of .hrd files each naming its
+// class and name. This is FarColorer's "user file of color styles", and like
+// FarColorer (FarHrcSettings::applySettings) it is loaded after the catalog and
+// before the user's schemes. Returns 0 for a bad handle.
+int colorer_load_user_hrd(void* handle, const char* path) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !path) return 0;
+    UnicodeString location(path);
+    session->factory->loadHrdPath(&location);
+    return 1;
+}
+
+// The user's own schemes: an .hrc file, or a folder whose .hrc files are all
+// loaded except *.ent.hrc — FarColorer's "user file of schemes". Returns 0 for
+// a bad handle.
+int colorer_load_user_hrc(void* handle, const char* path) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !path) return 0;
+    UnicodeString location(path);
+    session->factory->loadHrcPath(&location);
+    return 1;
+}
+
 void colorer_destroy(void* handle) {
     if (handle) {
         delete static_cast<ColorerSession*>(handle);

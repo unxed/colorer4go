@@ -38,6 +38,38 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 * `configDirMount`: The path on the host machine containing the Colorer configurations (e.g., `"colorer/configs"`). It will be mounted as the root `/` inside the WASM sandbox.
 * `opts`: optional; see [Diagnostics](#diagnostics).
 
+#### `func WithUserHRD` and `func WithUserHRC`
+The user's own colour styles and schemes, loaded on top of the catalog — what
+FarColorer calls the user file of color styles and the user file of schemes.
+```go
+func WithUserHRD(path string) Option
+func WithUserHRC(path string) Option
+```
+Both take a host path. `WithUserHRD` accepts an XML file in the catalog's
+`<hrd-sets>` format, or a folder of `.hrd` files that name themselves in their
+root element (`<hrd class="rgb" name="mine" description="My style">`).
+`WithUserHRC` accepts an `.hrc` file, or a folder from which every `.hrc` file
+except `*.ent.hrc` is loaded. They are loaded after the catalog, styles first,
+in FarColorer's order; the styles are then listed by `EnumHRDInstances` and
+accepted by `SetHRD` like the catalog's own.
+
+The module sees only what is mounted into it, so each path's folder is mounted
+read-only beside the configuration directory. Two consequences:
+
+* A `<location link>` in an `<hrd-sets>` file is resolved by Colorer against
+  `catalog.xml`, not against the file holding it; it has to stay inside the
+  configuration directory. A folder of `.hrd` files has no such limit. Links
+  inside `.hrc` files are resolved against the file itself and work as long as
+  they stay inside the named folder.
+* File names Colorer opens must be ASCII: its legacy strings read a name as
+  CP1251, and a name that does not survive that does not open or aborts the
+  call. Such a path is refused with a diagnostic instead. The folder's own name
+  does not matter.
+
+A path that does not exist is reported at `LevelWarn` and skipped. A file
+Colorer cannot parse fails `NewSession` with an error that names the host path
+and wraps the `*FatalError`.
+
 #### `func (*Session) SelectType`
 Selects the syntax highlighting scheme (HRC type) based on the file name and/or the first line of the file.
 ```go

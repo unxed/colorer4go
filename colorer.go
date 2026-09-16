@@ -158,6 +158,9 @@ type Option func(*sessionOptions)
 type sessionOptions struct {
 	level   Level
 	handler func(Diagnostic)
+
+	userHRD string
+	userHRC string
 }
 
 // WithDiagnostics delivers every message Colorer reports at level or more
@@ -173,6 +176,116 @@ func WithDiagnostics(level Level, handler func(Diagnostic)) Option {
 		o.level = level
 		o.handler = handler
 	}
+}
+
+// WithUserHRD loads the user's own colour styles on top of the catalog, the
+// way FarColorer loads its "user file of color styles". path is a host path to
+// either an XML file in the catalog's <hrd-sets> format, or a folder of .hrd
+// files, each of which names itself in its root element:
+//
+//	<hrd xmlns="http://colorer.sf.net/2003/hrd" class="rgb" name="mine" description="My style">
+//
+// The styles are then listed by EnumHRDInstances and accepted by SetHRD like
+// the catalog's own.
+//
+// Colorer resolves a <location link> in an <hrd-sets> file against
+// catalog.xml, not against the file that contains it, and the module sees
+// only what is mounted into it: the configuration directory and the folder of
+// path. A link must therefore be relative to catalog.xml and stay inside the
+// configuration directory; a folder of .hrd files has no such limit.
+//
+// Names Colorer opens must be ASCII: the library is built with its legacy
+// strings, which read a file name as CP1251, and a name that does not survive
+// that — a Cyrillic "И", any CJK character — does not open, or aborts the
+// call. The folder itself, which is mounted, may be named anything. A file,
+// or a folder holding a .hrd file, with a name that is not ASCII is reported
+// and skipped rather than handed to Colorer.
+//
+// A path that does not exist is reported as a LevelWarn diagnostic and
+// skipped, so a mistyped setting does not stop highlighting. A file Colorer
+// cannot read fails NewSession with a *FatalError, wrapped in an error that
+// names the host path.
+func WithUserHRD(path string) Option {
+	return func(o *sessionOptions) {
+		o.userHRD = path
+	}
+}
+
+// WithUserHRC loads the user's own schemes on top of the catalog, the way
+// FarColorer loads its "user file of schemes". path is a host path to either
+// an .hrc file or a folder, from which every .hrc file except *.ent.hrc is
+// loaded. Links inside those files are resolved against the file itself, so
+// they work as long as they stay inside the folder that was named.
+//
+// User schemes are loaded after user colour styles, in FarColorer's order.
+// File names and error handling are those of WithUserHRD; a link inside a
+// scheme is not checked in advance.
+func WithUserHRC(path string) Option {
+	return func(o *sessionOptions) {
+		o.userHRC = path
+	}
+}
+
+// Where the user's own files are mounted inside the module. The configuration
+// directory is the root, so these names only have to be ones no catalog uses.
+const (
+	userHRDGuestDir = "/.colorer4go/user-hrd"
+	userHRCGuestDir = "/.colorer4go/user-hrc"
+)
+
+// userLoad is one user path to hand to Colorer once the catalog is loaded.
+type userLoad struct {
+	op        string // the wrapper function that loads it
+	what      string // for error messages
+	hostPath  string
+	guestPath string
+	// loads tells which files of a folder Colorer opens, as
+	// ParserFactory::Impl::loadHrdPath and loadHrcPath select them.
+	loads func(name string) bool
+}
+
+func loadsHRD(name string) bool { return strings.HasSuffix(name, ".hrd") }
+
+func loadsHRC(name string) bool {
+	return strings.HasSuffix(name, ".hrc") && !strings.HasSuffix(name, ".ent.hrc")
+}
+
+// userMount works out how a host path is reached from inside the module. The
+// module cannot mount a single file, so a file is reached through a read-only
+// mount of the folder that holds it, and a folder through a mount of itself.
+// It refuses a path whose files Colorer could not open by name; see
+// WithUserHRD.
+func userMount(hostPath, guestDir string, loads func(string) bool) (hostDir, guestPath string, err error) {
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return "", "", err
+	}
+	if !info.IsDir() {
+		name := filepath.Base(hostPath)
+		if !isASCII(name) {
+			return "", "", fmt.Errorf("file name %q is not ASCII, which Colorer cannot open", name)
+		}
+		return filepath.Dir(hostPath), guestDir + "/" + name, nil
+	}
+	entries, err := os.ReadDir(hostPath)
+	if err != nil {
+		return "", "", err
+	}
+	for _, e := range entries {
+		if loads(e.Name()) && !isASCII(e.Name()) {
+			return "", "", fmt.Errorf("%q holds %q, a file name that is not ASCII, which Colorer cannot open", hostPath, e.Name())
+		}
+	}
+	return hostPath, guestDir, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // FatalError reports a call into Colorer that did not return. The module was
@@ -414,11 +527,31 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 		return nil, err
 	}
 
-	// Mount the host config directory containing XML schemas to the WASM root "/".
-	// The module's stdout and stderr go to the diagnostics handler when there
-	// is one, and to the process's own streams otherwise.
+	// Mount the host config directory containing XML schemas to the WASM root
+	// "/", and the user's own styles and schemes, read-only, beside it. The
+	// module's stdout and stderr go to the diagnostics handler when there is
+	// one, and to the process's own streams otherwise.
+	fsConfig := wazero.NewFSConfig().WithDirMount(configDirMount, "/")
+	var userLoads []userLoad
+	for _, u := range []userLoad{
+		{op: "colorer_load_user_hrd", what: "user colour styles", hostPath: host.opts.userHRD, guestPath: userHRDGuestDir, loads: loadsHRD},
+		{op: "colorer_load_user_hrc", what: "user schemes", hostPath: host.opts.userHRC, guestPath: userHRCGuestDir, loads: loadsHRC},
+	} {
+		if u.hostPath == "" {
+			continue
+		}
+		hostDir, guestPath, mErr := userMount(u.hostPath, u.guestPath, u.loads)
+		if mErr != nil {
+			host.deliver(Diagnostic{Level: LevelWarn, File: "colorer4go", Message: fmt.Sprintf("%s not loaded: %v", u.what, mErr)})
+			continue
+		}
+		fsConfig = fsConfig.WithReadOnlyDirMount(hostDir, u.guestPath)
+		host.deliver(Diagnostic{Level: LevelInfo, File: "colorer4go", Message: fmt.Sprintf("%s %q are seen by Colorer as %q", u.what, u.hostPath, guestPath)})
+		u.guestPath = guestPath
+		userLoads = append(userLoads, u)
+	}
 	config := wazero.NewModuleConfig().
-		WithFSConfig(wazero.NewFSConfig().WithDirMount(configDirMount, "/")).
+		WithFSConfig(fsConfig).
 		WithStdout(&streamWriter{host: host, name: "stdout", level: LevelInfo, out: os.Stdout}).
 		WithStderr(&streamWriter{host: host, name: "stderr", level: LevelError, out: os.Stderr})
 
@@ -473,6 +606,12 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 		r.Close(ctx)
 		return nil, errors.New("colorer_init returned null pointer")
 	}
+	for _, u := range userLoads {
+		if err := loadUserPath(ctx, host, mod, uint32(res[0]), u); err != nil {
+			r.Close(ctx)
+			return nil, err
+		}
+	}
 
 	s := &Session{
 		ctx:  ctx,
@@ -485,6 +624,27 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 	s.parseLineFn = mod.ExportedFunction("colorer_parse_line")
 	s.getRegionsFn = mod.ExportedFunction("colorer_get_regions")
 	return s, nil
+}
+
+// loadUserPath hands one mounted user path to Colorer.
+func loadUserPath(ctx context.Context, host *hostState, mod api.Module, handle uint32, u userLoad) error {
+	b := append([]byte(u.guestPath), 0)
+	res, err := callFn(ctx, host, mod.ExportedFunction("colorer_alloc"), "colorer_alloc", uint64(len(b)))
+	if err != nil {
+		return err
+	}
+	ptr := uint32(res[0])
+	mod.Memory().Write(ptr, b)
+	res, err = callFn(ctx, host, mod.ExportedFunction(u.op), u.op, uint64(handle), uint64(ptr))
+	if err != nil {
+		// A failed call leaves nothing worth freeing; the runtime is closed next.
+		return fmt.Errorf("loading %s %q (seen by Colorer as %q): %w", u.what, u.hostPath, u.guestPath, err)
+	}
+	_, _ = callFn(ctx, host, mod.ExportedFunction("colorer_free"), "colorer_free", uint64(ptr))
+	if res[0] == 0 {
+		return fmt.Errorf("%s refused the session handle", u.op)
+	}
+	return nil
 }
 
 func (s *Session) Close() {
