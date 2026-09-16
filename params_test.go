@@ -84,3 +84,58 @@ func TestSetFileType_OverridesTheChoice(t *testing.T) {
 		t.Errorf("parsing as C: %v, %d regions", err, len(regions))
 	}
 }
+
+func TestFileTypeParams_ListAndReset(t *testing.T) {
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "hrcsettings.xml")
+	writeFile(t, settings, testHRCSettings)
+	user := filepath.Join(dir, "user-settings.xml")
+	writeFile(t, user, `<?xml version="1.0" encoding="UTF-8"?>
+<hrc-settings>
+  <prototype name="json">
+    <param name="favorite" value="true"/>
+  </prototype>
+</hrc-settings>
+`)
+	s, err := NewSession(context.Background(), "/base/catalog.xml", verifyConfigsOnHost(t),
+		WithHRCSettings(settings), WithUserHRCSettings(user))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	byName := func() map[string]FileTypeParamInfo {
+		params, err := s.FileTypeParams("json")
+		if err != nil {
+			t.Fatalf("FileTypeParams: %v", err)
+		}
+		m := map[string]FileTypeParamInfo{}
+		for _, p := range params {
+			m[p.Name] = p
+		}
+		return m
+	}
+	params := byName()
+	if p := params["hotkey"]; p.Default != "" || p.UserSet || p.Description == "" {
+		t.Errorf("hotkey = %+v; want the default type's, with its description", p)
+	}
+	if p := params["favorite"]; p.Value != "true" {
+		t.Errorf("favorite = %+v; want true from the user HRC settings", p)
+	}
+
+	if err := s.SetFileTypeParam("json", "hotkey", "J"); err != nil {
+		t.Fatalf("SetFileTypeParam: %v", err)
+	}
+	if p := byName()["hotkey"]; p.Value != "J" || !p.UserSet {
+		t.Errorf("hotkey after set = %+v", p)
+	}
+	if err := s.ResetFileTypeParam("json", "hotkey"); err != nil {
+		t.Fatalf("ResetFileTypeParam: %v", err)
+	}
+	if p := byName()["hotkey"]; p.Value != "" || p.UserSet {
+		t.Errorf("hotkey after reset = %+v", p)
+	}
+	if _, err := s.FileTypeParams("no-such-type"); err == nil {
+		t.Error("listed the parameters of a type that does not exist")
+	}
+}

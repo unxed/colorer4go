@@ -288,9 +288,10 @@ type sessionOptions struct {
 	level   Level
 	handler func(Diagnostic)
 
-	userHRD     string
-	userHRC     string
-	hrcSettings string
+	userHRD         string
+	userHRC         string
+	hrcSettings     string
+	userHRCSettings string
 }
 
 // WithDiagnostics delivers every message Colorer reports at level or more
@@ -369,12 +370,22 @@ func WithHRCSettings(path string) Option {
 	}
 }
 
+// WithUserHRCSettings loads the user's own <hrc-settings> file after the user's
+// schemes, as FarColorer loads its UserHrcSettingsPath: prototypes there
+// override parameters of file types. Paths are handled as in WithHRCSettings.
+func WithUserHRCSettings(path string) Option {
+	return func(o *sessionOptions) {
+		o.userHRCSettings = path
+	}
+}
+
 // Where the user's own files are mounted inside the module. The configuration
 // directory is the root, so these names only have to be ones no catalog uses.
 const (
-	hrcSettingsGuestDir = "/.colorer4go/hrc-settings"
-	userHRDGuestDir     = "/.colorer4go/user-hrd"
-	userHRCGuestDir     = "/.colorer4go/user-hrc"
+	hrcSettingsGuestDir     = "/.colorer4go/hrc-settings"
+	userHRCSettingsGuestDir = "/.colorer4go/user-hrc-settings"
+	userHRDGuestDir         = "/.colorer4go/user-hrd"
+	userHRCGuestDir         = "/.colorer4go/user-hrc"
 )
 
 // userLoad is one user path to hand to Colorer once the catalog is loaded.
@@ -683,6 +694,7 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 		{op: "colorer_load_hrc_settings", what: "HRC settings", hostPath: host.opts.hrcSettings, guestPath: hrcSettingsGuestDir, loads: func(string) bool { return false }, fileOnly: true},
 		{op: "colorer_load_user_hrd", what: "user colour styles", hostPath: host.opts.userHRD, guestPath: userHRDGuestDir, loads: loadsHRD},
 		{op: "colorer_load_user_hrc", what: "user schemes", hostPath: host.opts.userHRC, guestPath: userHRCGuestDir, loads: loadsHRC},
+		{op: "colorer_load_hrc_settings", what: "user HRC settings", hostPath: host.opts.userHRCSettings, guestPath: userHRCSettingsGuestDir, loads: func(string) bool { return false }, fileOnly: true},
 	} {
 		if u.hostPath == "" {
 			continue
@@ -1099,6 +1111,108 @@ func (s *Session) SetFileTypeParam(typeName, param, value string) error {
 		return fmt.Errorf("colorer: no file type named %q", typeName)
 	case -1:
 		return fmt.Errorf("colorer: neither %q nor \"default\" has a parameter %q", typeName, param)
+	}
+	return nil
+}
+
+// FileTypeParamInfo is one parameter of a file type, as FarColorer's HRC
+// settings dialog shows it.
+type FileTypeParamInfo struct {
+	Name        string
+	Value       string // the value in effect
+	Default     string // the value without the user's
+	Description string
+	UserSet     bool // the user has set a value
+}
+
+// FileTypeParams lists a type's parameters as FarEditorSet::buildParamsList
+// does: the "default" type's, then the type's own that "default" lacks.
+func (s *Session) FileTypeParams(typeName string) ([]FileTypeParamInfo, error) {
+	countFn, err := s.exportedFn("colorer_file_type_params")
+	if err != nil {
+		return nil, err
+	}
+	getFn, err := s.exportedFn("colorer_get_file_type_params")
+	if err != nil {
+		return nil, err
+	}
+	ptr, free, err := s.writeCString(typeName)
+	if err != nil {
+		return nil, err
+	}
+	defer free()
+	ret, err := s.call(countFn, "colorer_file_type_params", uint64(s.ptr), uint64(ptr))
+	if err != nil {
+		return nil, err
+	}
+	count := int(int32(ret[0]))
+	if count < 0 {
+		return nil, fmt.Errorf("colorer: no file type named %q", typeName)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	ptrRes, err := s.call(getFn, "colorer_get_file_type_params", uint64(s.ptr))
+	if err != nil {
+		return nil, err
+	}
+	const recSize = 20
+	buf, ok := s.mod.Memory().Read(uint32(ptrRes[0]), uint32(count*recSize))
+	if !ok {
+		return nil, errors.New("failed to read parameter array from wasm memory")
+	}
+	str := func(p uint32) (string, error) {
+		if p == 0 {
+			return "", nil
+		}
+		return readString(s.mod.Memory(), p)
+	}
+	params := make([]FileTypeParamInfo, count)
+	for i := range params {
+		rec := buf[i*recSize:]
+		var fields [4]string
+		for f := range fields {
+			if fields[f], err = str(binary.LittleEndian.Uint32(rec[f*4:])); err != nil {
+				return nil, err
+			}
+		}
+		params[i] = FileTypeParamInfo{
+			Name:        fields[0],
+			Value:       fields[1],
+			Default:     fields[2],
+			Description: fields[3],
+			UserSet:     binary.LittleEndian.Uint32(rec[16:20]) != 0,
+		}
+	}
+	return params, nil
+}
+
+// ResetFileTypeParam takes the user's value of a type's parameter back. It is
+// an error when the type or the parameter does not exist.
+func (s *Session) ResetFileTypeParam(typeName, param string) error {
+	fn, err := s.exportedFn("colorer_reset_file_type_param")
+	if err != nil {
+		return err
+	}
+	tPtr, freeT, err := s.writeCString(typeName)
+	if err != nil {
+		return err
+	}
+	defer freeT()
+	pPtr, freeP, err := s.writeCString(param)
+	if err != nil {
+		return err
+	}
+	defer freeP()
+	ret, err := s.call(fn, "colorer_reset_file_type_param", uint64(s.ptr), uint64(tPtr), uint64(pPtr))
+	if err != nil {
+		return err
+	}
+	switch int32(ret[0]) {
+	case 0:
+		return fmt.Errorf("colorer: no file type named %q", typeName)
+	case -1:
+		return fmt.Errorf("colorer: %q has no parameter %q", typeName, param)
 	}
 	return nil
 }

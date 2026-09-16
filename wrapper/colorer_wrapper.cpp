@@ -305,6 +305,16 @@ public:
     }
 };
 
+// One parameter of a file type as FarColorer's HRC settings dialog shows it.
+// Strings are UTF-8.
+struct WasmParamInfo {
+    const char* name;
+    const char* value;        // the value in effect
+    const char* def;          // the value without the user's
+    const char* description;
+    int user_set;             // the user has set a value
+};
+
 struct ColorerSession {
     std::unique_ptr<ParserFactory> factory;
     std::unique_ptr<TextParser> parser;
@@ -327,6 +337,11 @@ struct ColorerSession {
     FileType* current_type = nullptr;
     std::string current_type_name;
     std::string last_param;
+
+    // Filled by colorer_file_type_params. The strings live in a deque so the
+    // pointers in params stay valid while it grows.
+    std::deque<std::string> param_strings;
+    std::vector<struct WasmParamInfo> params;
 
     // Reused across colorer_parse_line calls so a session that has already
     // seen a line at least this long does not pay for a malloc/free pair on
@@ -521,6 +536,77 @@ int colorer_select_type(void* handle, const char* file_name, const char* first_l
 
 static UnicodeString utf8(const char* s) {
     return UnicodeString(s, static_cast<int32_t>(strlen(s)), Encodings::ENC_UTF8);
+}
+
+// Takes the user's value of a type's parameter back, as FarColorer's dialog
+// does when <default-...> is picked. Returns 1, 0 when the type does not exist,
+// -1 when it has no such parameter.
+int colorer_reset_file_type_param(void* handle, const char* type_name, const char* param) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !type_name || !param) return 0;
+    UnicodeString name = utf8(type_name);
+    FileType* type = session->factory->getHrcLibrary().getFileType(&name);
+    if (!type) return 0;
+    UnicodeString param_name = utf8(param);
+    if (type->getParamValue(param_name) == nullptr) return -1;
+    type->setParamValue(param_name, nullptr);
+    return 1;
+}
+
+// Lists a type's parameters as FarEditorSet::buildParamsList does — the
+// "default" type's, then the type's own that "default" lacks — with each one's
+// value, default (FarEditorSet::getParamDefValue) and description. Returns
+// the count, or -1 when the type does not exist.
+int colorer_file_type_params(void* handle, const char* type_name) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session || !type_name) return -1;
+    auto& library = session->factory->getHrcLibrary();
+    UnicodeString name = utf8(type_name);
+    FileType* type = library.getFileType(&name);
+    if (!type) return -1;
+    UnicodeString default_name("default");
+    FileType* def = library.getFileType(&default_name);
+
+    session->params.clear();
+    session->param_strings.clear();
+    auto keep = [session](const UnicodeString* s) -> const char* {
+        if (!s) return nullptr;
+        session->param_strings.emplace_back(s->getChars(Encodings::ENC_UTF8));
+        return session->param_strings.back().c_str();
+    };
+    std::vector<UnicodeString> names;
+    if (def) {
+        names = def->enumParams();
+    }
+    for (const auto& p : type->enumParams()) {
+        if (!def || def->getParamValue(p) == nullptr) {
+            names.push_back(p);
+        }
+    }
+    for (const auto& p : names) {
+        const UnicodeString* value = type->getParamValue(p);
+        if (!value && def) value = def->getParamValue(p);
+        const UnicodeString* dflt = type->getParamDefaultValue(p);
+        if (!dflt && def) dflt = def->getParamValue(p);
+        const UnicodeString* description = type->getParamDescription(p);
+        if (!description && def) description = def->getParamDescription(p);
+        WasmParamInfo info;
+        info.name = keep(&p);
+        info.value = keep(value);
+        info.def = keep(dflt);
+        info.description = keep(description);
+        info.user_set = type->getParamUserValue(p) != nullptr ? 1 : 0;
+        session->params.push_back(info);
+    }
+    return static_cast<int>(session->params.size());
+}
+
+static_assert(sizeof(WasmParamInfo) == 20, "WasmParamInfo must pack to 20 bytes for the Go reader");
+
+const void* colorer_get_file_type_params(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return nullptr;
+    return session->params.data();
 }
 
 // Gives the parser the named type instead of choosing one by file name, as

@@ -119,6 +119,11 @@ name; `FileType` says which type it has. File types carry parameters —
 `WithHRCSettings`. `SetFileTypeParam` sets a user value as
 `FarEditorSet::addParamAndValue` does, adding a parameter the type lacks with
 the `default` type's value.
+`FileTypeParams` lists a type's parameters with value, default and
+description, as FarColorer's HRC settings dialog shows them;
+`ResetFileTypeParam` takes a user value back. `WithUserHRCSettings` loads the
+user's own `<hrc-settings>` file after the user's schemes, as FarColorer's
+UserHrcSettingsPath.
 
 #### `func (*Session) ParseLinePairs`
 `ParseLine` that also returns the line's paired tokens — brackets, `begin`/`end`
