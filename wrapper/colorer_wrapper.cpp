@@ -145,12 +145,31 @@ struct WasmPair {
     int isBackSet;
 };
 
+// One region of a line that Colorer's Outliner collects: under def:Outlined
+// (FarColorer's list of functions) or def:Error (its list of errors). As in
+// Outliner::addRegion, the first such region of a line starts an item and
+// later ones on the same line add their text to it; starts tells which.
+// Offsets, not text, cross into Go: labels are cut from the line there, since
+// the library's legacy strings would re-encode them as CP1251.
+struct WasmOutlineSpan {
+    int error;   // 1 for def:Error, 0 for def:Outlined
+    int start;
+    int end;
+    int level;   // Outliner's curLevel: schemes entered, counted from startParsing
+    int starts;  // 1 when this region starts an item
+    const char* name;
+};
+
 class WasmRegionHandler : public LineRegionsSupport {
 public:
     std::vector<WasmRegion> regions;
     std::vector<WasmPair> pairs;
-    // Resolved on first use: def.hrc is loaded with the first type that
-    // imports it, and until then the library has no such regions.
+    std::vector<WasmOutlineSpan> outline;
+    const Region* outlined = nullptr;
+    const Region* error = nullptr;
+    int level = 0;
+    bool line_has_item[2] = {false, false};
+    // Resolved by resolveRegions before each parse, until they exist.
     const Region* pair_start = nullptr;
     const Region* pair_end = nullptr;
     HrcLibrary* library = nullptr;
@@ -163,18 +182,61 @@ public:
     void clear() {
         regions.clear();
         pairs.clear();
+        outline.clear();
         LineRegionsSupport::clear();
+    }
+
+    // Looks up the def regions pairs and outlines are recognised by, once they
+    // exist: def.hrc is loaded with the first type that imports it. It must run
+    // outside TextParser::parse: parse holds the library's shared lock and
+    // HrcLibrary::getRegion takes the exclusive one. Looked up from inside
+    // addRegion, it trapped the module with no message.
+    void resolveRegions() {
+        if (!library || (pair_start && pair_end && outlined && error)) return;
+        UnicodeString start_name("def:PairStart");
+        UnicodeString end_name("def:PairEnd");
+        UnicodeString outlined_name("def:Outlined");
+        UnicodeString error_name("def:Error");
+        pair_start = library->getRegion(&start_name);
+        pair_end = library->getRegion(&end_name);
+        outlined = library->getRegion(&outlined_name);
+        error = library->getRegion(&error_name);
+    }
+
+    // Outliner's bookkeeping, beside LineRegionsSupport's own.
+    void startParsing(size_t lno) override {
+        LineRegionsSupport::startParsing(lno);
+        level = 0;
+    }
+    void clearLine(size_t lno, UnicodeString* line) override {
+        LineRegionsSupport::clearLine(lno, line);
+        line_has_item[0] = line_has_item[1] = false;
+    }
+    void enterScheme(size_t lno, UnicodeString* line, int sx, int ex, const Region* region, const Scheme* scheme) override {
+        LineRegionsSupport::enterScheme(lno, line, sx, ex, region, scheme);
+        level++;
+    }
+    void leaveScheme(size_t lno, UnicodeString* line, int sx, int ex, const Region* region, const Scheme* scheme) override {
+        LineRegionsSupport::leaveScheme(lno, line, sx, ex, region, scheme);
+        level--;
+    }
+    void addRegion(size_t lno, UnicodeString* line, int sx, int ex, const Region* region) override {
+        LineRegionsSupport::addRegion(lno, line, sx, ex, region);
+        if (!region) return;
+        for (int kind = 0; kind < 2; kind++) {
+            const Region* search = kind == 0 ? outlined : error;
+            if (!search || !region->hasParent(search)) continue;
+            if (name_cache.find(region) == name_cache.end()) {
+                name_cache[region] = UStr::to_stdstr(&region->getName());
+            }
+            outline.push_back({kind, sx, ex, level, line_has_item[kind] ? 0 : 1, name_cache[region].c_str()});
+            line_has_item[kind] = true;
+        }
     }
 
     // Whether region is a pair start (1), a pair end (0), or neither (-1),
     // tested as BaseEditor::getPairMatch and searchPair test it.
     int pairKind(const Region* region) {
-        if (library && (!pair_start || !pair_end)) {
-            UnicodeString start_name("def:PairStart");
-            UnicodeString end_name("def:PairEnd");
-            pair_start = library->getRegion(&start_name);
-            pair_end = library->getRegion(&end_name);
-        }
         if (pair_start && region->hasParent(pair_start)) return 1;
         if (pair_end && region->hasParent(pair_end)) return 0;
         return -1;
@@ -495,6 +557,7 @@ int colorer_parse_line(void* handle, const char* line_utf8, int line_len) {
     session->line_source.append(UnicodeString(line_utf8, line_len, Encodings::ENC_UTF8));
 
     session->region_handler.setFirstLine(lno);
+    session->region_handler.resolveRegions();
     session->parser->parse(lno, 1, TextParser::TextParseMode::TPM_CACHE_UPDATE);
     session->region_handler.harvest(lno);
     return session->region_handler.regions.size();
@@ -518,6 +581,22 @@ const void* colorer_get_regions(void* handle) {
 }
 
 static_assert(sizeof(WasmPair) == 32, "WasmPair must pack to 32 bytes for the batched Go reader");
+
+static_assert(sizeof(WasmOutlineSpan) == 24, "WasmOutlineSpan must pack to 24 bytes for the batched Go reader");
+
+// The outline regions of the line colorer_parse_line parsed last, in the order
+// Colorer reported them; valid until the next parse or reset.
+int colorer_outline_count(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return 0;
+    return static_cast<int>(session->region_handler.outline.size());
+}
+
+const void* colorer_get_outline(void* handle) {
+    auto* session = static_cast<ColorerSession*>(handle);
+    if (!session) return nullptr;
+    return session->region_handler.outline.data();
+}
 
 // The pairs of the line colorer_parse_line parsed last, in the order Colorer
 // reported them; valid until the next parse or reset.

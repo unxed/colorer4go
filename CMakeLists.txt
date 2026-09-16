@@ -152,6 +152,8 @@ target_link_options(
         "-Wl,--export=colorer_get_regions"
         "-Wl,--export=colorer_pair_count"
         "-Wl,--export=colorer_get_pairs"
+        "-Wl,--export=colorer_outline_count"
+        "-Wl,--export=colorer_get_outline"
         "-Wl,--export=colorer_forget_before"
         "-Wl,--export=colorer_first_line"
         "-Wl,--export=colorer_next_line"

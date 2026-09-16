@@ -75,6 +75,115 @@ type Pair struct {
 	IsBackSet bool
 }
 
+// OutlineItem is one entry of Colorer's Outliner found on a line: a region
+// under def:Outlined — what FarColorer lists as functions — or, with Error,
+// under def:Error. The first such region of a line starts the item; later ones
+// on the same line add their text, so the label is the text of every span in
+// order. Offsets are those of Region.
+type OutlineItem struct {
+	Error  bool
+	Region string // the first region's name, e.g. "def:Function"
+	Start  int    // where the first region starts
+	// Level is the depth of schemes the first region lies in, as Outliner
+	// counts it; FarColorer indents its list by it.
+	Level int
+	Spans []OutlineSpan
+}
+
+// OutlineSpan is one region's part of an OutlineItem label.
+type OutlineSpan struct {
+	Start int
+	End   int
+}
+
+// Label cuts the item's text from line, the text that was parsed.
+func (it OutlineItem) Label(line string) string {
+	runes := []rune(line)
+	var b strings.Builder
+	for _, sp := range it.Spans {
+		start, end := sp.Start, sp.End
+		if start < 0 {
+			start = 0
+		}
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if start < end {
+			b.WriteString(string(runes[start:end]))
+		}
+	}
+	return b.String()
+}
+
+// wasmOutlineSpanSize is sizeof(WasmOutlineSpan) in colorer_wrapper.cpp.
+const wasmOutlineSpanSize = 24
+
+// LineOutline returns the outline items of the line ParseLine or
+// ParseLinePairs parsed last: Colorer's Outliner, for def:Outlined and
+// def:Error at once. Parsing every line of a file and collecting these gives
+// FarColorer's list of functions and list of errors.
+func (s *Session) LineOutline() ([]OutlineItem, error) {
+	countFn, err := s.exportedFn("colorer_outline_count")
+	if err != nil {
+		return nil, err
+	}
+	ret, err := s.call(countFn, "colorer_outline_count", uint64(s.ptr))
+	if err != nil {
+		return nil, err
+	}
+	count := int(int32(ret[0]))
+	if count <= 0 {
+		return nil, nil
+	}
+	getFn, err := s.exportedFn("colorer_get_outline")
+	if err != nil {
+		return nil, err
+	}
+	ptrRes, err := s.call(getFn, "colorer_get_outline", uint64(s.ptr))
+	if err != nil {
+		return nil, err
+	}
+	buf, ok := s.mod.Memory().Read(uint32(ptrRes[0]), uint32(count*wasmOutlineSpanSize))
+	if !ok {
+		return nil, errors.New("failed to read outline array from wasm memory")
+	}
+	if s.nameCache == nil {
+		s.nameCache = make(map[uint32]string)
+	}
+	var items []OutlineItem
+	last := [2]int{-1, -1}
+	for i := 0; i < count; i++ {
+		rec := buf[i*wasmOutlineSpanSize:]
+		kind := 0
+		if binary.LittleEndian.Uint32(rec[0:4]) != 0 {
+			kind = 1
+		}
+		span := OutlineSpan{
+			Start: int(int32(binary.LittleEndian.Uint32(rec[4:8]))),
+			End:   int(int32(binary.LittleEndian.Uint32(rec[8:12]))),
+		}
+		if binary.LittleEndian.Uint32(rec[16:20]) != 0 || last[kind] < 0 {
+			namePtr := binary.LittleEndian.Uint32(rec[20:24])
+			name, cached := s.nameCache[namePtr]
+			if !cached {
+				if name, err = readString(s.mod.Memory(), namePtr); err != nil {
+					return nil, err
+				}
+				s.nameCache[namePtr] = name
+			}
+			items = append(items, OutlineItem{
+				Error:  kind == 1,
+				Region: name,
+				Start:  span.Start,
+				Level:  int(int32(binary.LittleEndian.Uint32(rec[12:16]))),
+			})
+			last[kind] = len(items) - 1
+		}
+		items[last[kind]].Spans = append(items[last[kind]].Spans, span)
+	}
+	return items, nil
+}
+
 type RegionDefine struct {
 	Fore      uint32
 	Back      uint32

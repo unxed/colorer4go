@@ -117,6 +117,19 @@ the cursor, walk the following pairs (for a pair end, the preceding ones)
 across lines counting +1 per start and -1 per end, starting from 1 (or -1);
 the pair where the count reaches zero is the match.
 
+#### `func (*Session) LineOutline`
+The outline items of the line `ParseLine` or `ParseLinePairs` parsed last:
+Colorer's `Outliner`, for `def:Outlined` (FarColorer's list of functions) and
+`def:Error` (its list of errors) at once.
+```go
+func (s *Session) LineOutline() ([]OutlineItem, error)
+func (it OutlineItem) Label(line string) string
+```
+As in `Outliner::addRegion`, the first outlined region of a line starts an item
+and later ones on that line add their text to it; `Label` cuts that text out of
+the line. `Level` is the depth of schemes the item lies in. Parsing a whole file
+and collecting the items gives FarColorer's lists.
+
 #### `func (*Session) ForgetBefore`
 Releases the stored text of every session line below `line`.
 ```go
