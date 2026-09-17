@@ -44,6 +44,34 @@ func sharedCompilationCache() wazero.CompilationCache {
 	return compilationCache
 }
 
+// compileMu makes the sessions of a process compile the embedded module one
+// at a time.
+var compileMu sync.Mutex
+
+// compileColorer compiles the embedded module in r, one caller at a time.
+//
+// Every runtime created with sharedCompilationCache shares one wazero engine
+// and its table of compiled modules. In wazero v1.12.0 a module read from the
+// file cache is put in that table before its entry preambles are compiled
+// (engine_cache.go, getCompiledModule). A second session compiling at that
+// moment takes the module from the table, instantiates it, and panics in
+// moduleEngine.NewFunction on the empty preamble table: "index out of range
+// [14] with length 0" at module_engine.go:204, under
+// ExportedFunction("_initialize"). It happened in about 1% of processes that
+// set up 16 sessions at once on GitHub's runners, up to 8% on Windows under
+// load, and it was the crash f4's CI hit.
+//
+// CompileModule returns only once the module in the table is complete, so
+// serializing it closes that window. It is also what wazero's CompilationCache
+// documentation recommends -- compiling a module in one goroutine rather than
+// in several at once, which would each compile it -- and it costs nothing
+// after the first session: the rest find the module in the table.
+func compileColorer(ctx context.Context, r wazero.Runtime) (wazero.CompiledModule, error) {
+	compileMu.Lock()
+	defer compileMu.Unlock()
+	return r.CompileModule(ctx, colorerWasm)
+}
+
 type Region struct {
 	Start     int
 	End       int
@@ -658,7 +686,7 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
 	// Compile the module to inspect imports
-	compiled, err := r.CompileModule(ctx, colorerWasm)
+	compiled, err := compileColorer(ctx, r)
 	if err != nil {
 		r.Close(ctx)
 		return nil, err

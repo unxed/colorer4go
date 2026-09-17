@@ -21,10 +21,10 @@ import (
 // table (addCompiledModuleToMemory) before its entry preambles are compiled,
 // and the engine is shared by every runtime that uses the same
 // CompilationCache. A session that takes the module from that table in the
-// meantime and instantiates it reads an empty entryPreamblesPtrs. With a sleep
-// added to wazero between the two steps this test produced exactly that panic
-// and stack; what it is meant to find out here is whether it happens without
-// one, on real runners.
+// meantime and instantiates it reads an empty entryPreamblesPtrs. On GitHub's
+// runners, before NewSession serialized compilation (compileColorer), this
+// test panicked in about 1% of processes, and on windows-latest in 7 of 88
+// with spinning goroutines; it now checks that no process does.
 //
 // Only the first sessions of a process can meet the module half-published:
 // colorer4go never closes the CompiledModule, so after the first CompileModule

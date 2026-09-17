@@ -1,19 +1,21 @@
 name: Probe concurrent first sessions
 
-# Information gathering for a crash seen in f4's CI; see
-# probe_first_sessions_test.go. Run it by hand from the Actions tab.
+# Checks that sessions set up together at the start of a process do not panic
+# in wazero (see compileColorer and probe_first_sessions_test.go). Before the
+# fix, the configuration below panicked in 7 of 88 processes on windows-latest.
+# Run it by hand from the Actions tab.
 on:
   workflow_dispatch:
     inputs:
       runs:
-        description: Processes per configuration
+        description: Processes per runner
         default: "150"
 
 jobs:
   probe:
     name: Probe (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -39,24 +41,20 @@ jobs:
           RUNS: ${{ inputs.runs }}
         run: |
           set -u
+          burn=$(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) * 2 ))
           : > probe.log
-          for burn in 0 $(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) * 2 )); do
-            for step in 0s 1ms 3ms; do
-              crashed=0
-              for i in $(seq 1 "$RUNS"); do
-                if ! COLORER4GO_PROBE_BURN=$burn COLORER4GO_PROBE_STEP=$step \
-                     ./probe.test -test.run '^TestProbeFirstSessions$' >> probe.log 2>&1; then
-                  crashed=$((crashed + 1))
-                  echo "PROBE-CRASH burn=$burn step=$step run=$i" >> probe.log
-                fi
-              done
-              echo "burn=$burn step=$step runs=$RUNS crashed-processes=$crashed panicked-processes=$(grep '^PROBE-RESULT' probe.log | grep "step=$step burn=$burn " | grep -vc 'panics=0')"
-            done
+          crashed=0
+          for i in $(seq 1 "$RUNS"); do
+            if ! COLORER4GO_PROBE_BURN=$burn COLORER4GO_PROBE_STEP=0s \
+                 ./probe.test -test.run '^TestProbeFirstSessions$' >> probe.log 2>&1; then
+              crashed=$((crashed + 1))
+              echo "PROBE-CRASH run=$i" >> probe.log
+            fi
           done
-          echo "--- first panic, if any:"
-          grep -m1 -A40 'PROBE-FIRST-PANIC' probe.log || echo none
-          echo "--- first crash output, if any:"
-          grep -m1 -B60 'PROBE-CRASH' probe.log | grep -E 'panic|goroutine|\.go:' | head -40 || echo none
+          panicked=$(grep '^PROBE-RESULT' probe.log | grep -vc 'panics=0' || true)
+          echo "burn=$burn runs=$RUNS crashed-processes=$crashed panicked-processes=$panicked"
+          grep -m1 -A40 'PROBE-FIRST-PANIC' probe.log || true
+          if [ "$crashed" -ne 0 ] || [ "$panicked" -ne 0 ]; then exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
