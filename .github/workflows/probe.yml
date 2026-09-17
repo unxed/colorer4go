@@ -1,0 +1,64 @@
+name: Probe concurrent first sessions
+
+# Information gathering for a crash seen in f4's CI; see
+# probe_first_sessions_test.go. Run it by hand from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Processes per configuration
+        default: "150"
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-11-arm, windows-latest, ubuntu-24.04-arm, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build the test binary
+        shell: bash
+        run: go test -c -o probe.test .
+      - name: Warm the file cache
+        shell: bash
+        env:
+          COLORER4GO_PROBE: "1"
+          COLORER4GO_PROBE_WORKERS: "1"
+        run: ./probe.test -test.run '^TestProbeFirstSessions$' -test.v
+      - name: Run the probe
+        shell: bash
+        env:
+          COLORER4GO_PROBE: "1"
+          RUNS: ${{ inputs.runs }}
+        run: |
+          set -u
+          : > probe.log
+          for burn in 0 $(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) * 2 )); do
+            for step in 0s 1ms 3ms; do
+              crashed=0
+              for i in $(seq 1 "$RUNS"); do
+                if ! COLORER4GO_PROBE_BURN=$burn COLORER4GO_PROBE_STEP=$step \
+                     ./probe.test -test.run '^TestProbeFirstSessions$' >> probe.log 2>&1; then
+                  crashed=$((crashed + 1))
+                  echo "PROBE-CRASH burn=$burn step=$step run=$i" >> probe.log
+                fi
+              done
+              echo "burn=$burn step=$step runs=$RUNS crashed-processes=$crashed panicked-processes=$(grep '^PROBE-RESULT' probe.log | grep "step=$step burn=$burn " | grep -vc 'panics=0')"
+            done
+          done
+          echo "--- first panic, if any:"
+          grep -m1 -A40 'PROBE-FIRST-PANIC' probe.log || echo none
+          echo "--- first crash output, if any:"
+          grep -m1 -B60 'PROBE-CRASH' probe.log | grep -E 'panic|goroutine|\.go:' | head -40 || echo none
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.os }}
+          path: probe.log
