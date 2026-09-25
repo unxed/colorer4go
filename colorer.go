@@ -458,7 +458,7 @@ func userMount(hostPath, guestDir string, loads func(string) bool) (hostDir, gue
 	}
 	for _, e := range entries {
 		if loads(e.Name()) && !isASCII(e.Name()) {
-			return "", "", fmt.Errorf("%q holds %q, a file name that is not ASCII, which Colorer cannot open", hostPath, e.Name())
+			return "", "", fmt.Errorf("%s holds %q, a file name that is not ASCII, which Colorer cannot open", quoteHostPath(hostPath), e.Name())
 		}
 	}
 	return hostPath, guestDir, nil
@@ -729,14 +729,14 @@ func NewSession(ctx context.Context, catalogPath string, configDirMount string, 
 		}
 		hostDir, guestPath, mErr := userMount(u.hostPath, u.guestPath, u.loads)
 		if mErr == nil && u.fileOnly && guestPath == u.guestPath {
-			mErr = fmt.Errorf("%q is a folder, not a file", u.hostPath)
+			mErr = fmt.Errorf("%s is a folder, not a file", quoteHostPath(u.hostPath))
 		}
 		if mErr != nil {
 			host.deliver(Diagnostic{Level: LevelWarn, File: "colorer4go", Message: fmt.Sprintf("%s not loaded: %v", u.what, mErr)})
 			continue
 		}
 		fsConfig = fsConfig.WithReadOnlyDirMount(hostDir, u.guestPath)
-		host.deliver(Diagnostic{Level: LevelInfo, File: "colorer4go", Message: fmt.Sprintf("%s %q are seen by Colorer as %q", u.what, u.hostPath, guestPath)})
+		host.deliver(Diagnostic{Level: LevelInfo, File: "colorer4go", Message: fmt.Sprintf("%s %s are seen by Colorer as %q", u.what, quoteHostPath(u.hostPath), guestPath)})
 		u.guestPath = guestPath
 		userLoads = append(userLoads, u)
 	}
@@ -828,7 +828,7 @@ func loadUserPath(ctx context.Context, host *hostState, mod api.Module, handle u
 	res, err = callFn(ctx, host, mod.ExportedFunction(u.op), u.op, uint64(handle), uint64(ptr))
 	if err != nil {
 		// A failed call leaves nothing worth freeing; the runtime is closed next.
-		return fmt.Errorf("loading %s %q (seen by Colorer as %q): %w", u.what, u.hostPath, u.guestPath, err)
+		return fmt.Errorf("loading %s %s (seen by Colorer as %q): %w", u.what, quoteHostPath(u.hostPath), u.guestPath, err)
 	}
 	_, _ = callFn(ctx, host, mod.ExportedFunction("colorer_free"), "colorer_free", uint64(ptr))
 	if res[0] == 0 {
@@ -1451,4 +1451,17 @@ func readString(mem api.Memory, offset uint32) (string, error) {
 		offset++
 	}
 	return string(buf), nil
+}
+
+// quoteHostPath quotes a host path for a message so that it reads exactly as
+// the caller spelled it. %q would double every backslash of a Windows path
+// (C:\\Users\\...), so a printable path is only wrapped in quotes; one holding
+// quotes or unprintable characters still falls back to Go quoting.
+func quoteHostPath(p string) string {
+	for _, r := range p {
+		if r == '"' || !strconv.IsPrint(r) {
+			return strconv.Quote(p)
+		}
+	}
+	return `"` + p + `"`
 }
